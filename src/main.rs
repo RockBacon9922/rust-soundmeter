@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,77 @@ const CHART_DB_MAX: f32 = 120.0;
 const CHART_DB_MIN: f32 = 20.0;
 const DEMO_SAMPLE_MS: u64 = 120;
 const BIG_TEXT_UPDATE_MS: u64 = 400;
+const RMS_WINDOW_SAMPLES: usize = 32;
+const RESET_FLASH_MS: u64 = 900;
+const GRAPH_FILL_CHAR: char = '=';
+const GRAPH_CENTER_CHAR: char = '|';
+
+#[derive(Clone, Copy, Debug)]
+struct UiSettings {
+    limit_db: f32,
+    graph_min_db: f32,
+    graph_max_db: f32,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            limit_db: 85.0,
+            graph_min_db: CHART_DB_MIN,
+            graph_max_db: CHART_DB_MAX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuField {
+    Limit,
+    GraphMin,
+    GraphMax,
+    ViewMode,
+    ResetDefaults,
+}
+
+impl MenuField {
+    fn next(self) -> Self {
+        match self {
+            Self::Limit => Self::GraphMin,
+            Self::GraphMin => Self::GraphMax,
+            Self::GraphMax => Self::ViewMode,
+            Self::ViewMode => Self::ResetDefaults,
+            Self::ResetDefaults => Self::Limit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayMode {
+    Rms,
+    Peak,
+}
+
+impl DisplayMode {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Rms => Self::Peak,
+            Self::Peak => Self::Rms,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rms => "RMS",
+            Self::Peak => "PEAK",
+        }
+    }
+
+    fn unit_label(self) -> &'static str {
+        match self {
+            Self::Rms => "dB RMS",
+            Self::Peak => "dB PEAK",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-soundmeter")]
@@ -120,6 +193,7 @@ enum Command {
 struct Frame {
     decoded: Option<String>,
     db: Option<f32>,
+    rms_db: Option<f32>,
 }
 
 fn main() -> Result<()> {
@@ -327,11 +401,19 @@ fn run_tui_loop(
     } else {
         String::from("n/a")
     };
-    let mut latest_db: Option<f32> = None;
-    let mut display_db: Option<f32> = None;
+    let mut display_mode = DisplayMode::Peak;
+    let mut latest_peak_db: Option<f32> = None;
+    let mut display_peak_db: Option<f32> = None;
+    let mut latest_rms_db: Option<f32> = None;
+    let mut display_rms_db: Option<f32> = None;
     let mut last_big_update = Instant::now()
         .checked_sub(Duration::from_millis(BIG_TEXT_UPDATE_MS))
         .unwrap_or_else(Instant::now);
+    let mut rolling_rms = RollingRms::new(RMS_WINDOW_SAMPLES);
+    let mut settings = load_ui_settings().unwrap_or_default();
+    let mut show_menu = false;
+    let mut selected_field = MenuField::Limit;
+    let mut reset_flash_until: Option<Instant> = None;
     let demo_start = Instant::now();
     let mut last_demo_emit = Instant::now()
         .checked_sub(Duration::from_millis(DEMO_SAMPLE_MS))
@@ -348,11 +430,13 @@ fn run_tui_loop(
                 frames.push_front(Frame {
                     decoded: Some(format!("TX error: {e}")),
                     db: None,
+                    rms_db: None,
                 });
             } else {
                 frames.push_front(Frame {
                     decoded: Some("TX probe".to_string()),
                     db: None,
+                    rms_db: None,
                 });
             }
             while frames.len() > MAX_UI_FRAMES {
@@ -364,12 +448,15 @@ fn run_tui_loop(
         if demo {
             if last_demo_emit.elapsed() >= Duration::from_millis(DEMO_SAMPLE_MS) {
                 let db = synthetic_db(demo_start);
-                let decoded = Some(format!("demo current={db:.1} dB"));
+                let rms_db = rolling_rms.push_db(db);
+                let decoded = Some(format!("demo current={db:.1} dB rms={rms_db:.1} dB"));
                 last_decode = decoded.clone().unwrap_or_else(|| "n/a".to_string());
-                latest_db = Some(db);
+                latest_peak_db = Some(db);
+                latest_rms_db = Some(rms_db);
                 frames.push_front(Frame {
                     decoded,
                     db: Some(db),
+                    rms_db: Some(rms_db),
                 });
                 while frames.len() > MAX_UI_FRAMES {
                     frames.pop_back();
@@ -385,10 +472,14 @@ fn run_tui_loop(
                     if let Some(ref d) = decoded {
                         last_decode = d.clone();
                     }
+                    let mut rms_db = None;
                     if let Some(v) = db {
-                        latest_db = Some(v);
+                        latest_peak_db = Some(v);
+                        let rms = rolling_rms.push_db(v);
+                        latest_rms_db = Some(rms);
+                        rms_db = Some(rms);
                     }
-                    frames.push_front(Frame { decoded, db });
+                    frames.push_front(Frame { decoded, db, rms_db });
                     while frames.len() > MAX_UI_FRAMES {
                         frames.pop_back();
                     }
@@ -398,6 +489,7 @@ fn run_tui_loop(
                     frames.push_front(Frame {
                         decoded: Some(format!("Read error: {e}")),
                         db: None,
+                        rms_db: None,
                     });
                     while frames.len() > MAX_UI_FRAMES {
                         frames.pop_back();
@@ -407,22 +499,84 @@ fn run_tui_loop(
         }
 
         if last_big_update.elapsed() >= Duration::from_millis(BIG_TEXT_UPDATE_MS)
-            && latest_db.is_some()
+            && (latest_rms_db.is_some() || latest_peak_db.is_some())
         {
-            display_db = latest_db;
+            display_peak_db = latest_peak_db;
+            display_rms_db = latest_rms_db;
             last_big_update = Instant::now();
         }
 
-        draw_ui(terminal, vid, pid, &last_decode, display_db, &frames, false)?;
+        draw_ui(
+            terminal,
+            vid,
+            pid,
+            &last_decode,
+            display_peak_db,
+            display_rms_db,
+            display_mode,
+            &frames,
+            false,
+            settings,
+            show_menu,
+            selected_field,
+            reset_flash_until,
+            None,
+        )?;
 
-        if event::poll(Duration::from_millis(10)).context("event poll failed")?
-            && let Event::Key(k) = event::read().context("event read failed")?
-        {
-            let is_quit = k.code == KeyCode::Char('q');
-            let is_ctrl_c =
-                k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-            if is_quit || is_ctrl_c {
-                break;
+        if event::poll(Duration::from_millis(10)).context("event poll failed")? {
+            match event::read().context("event read failed")? {
+                Event::Key(k) => {
+                    let is_quit = k.code == KeyCode::Char('q');
+                    let is_ctrl_c =
+                        k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+                    match k.code {
+                        KeyCode::Char('m') => show_menu = !show_menu,
+                        KeyCode::Tab => {
+                            if show_menu {
+                                selected_field = selected_field.next();
+                            }
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            if show_menu {
+                                let did_reset = adjust_setting(
+                                    &mut settings,
+                                    &mut display_mode,
+                                    selected_field,
+                                    1.0,
+                                );
+                                if did_reset {
+                                    reset_flash_until =
+                                        Some(Instant::now() + Duration::from_millis(RESET_FLASH_MS));
+                                }
+                                autosave_ui_settings(settings, &mut last_decode);
+                            }
+                        }
+                        KeyCode::Char('-') => {
+                            if show_menu {
+                                let did_reset = adjust_setting(
+                                    &mut settings,
+                                    &mut display_mode,
+                                    selected_field,
+                                    -1.0,
+                                );
+                                if did_reset {
+                                    reset_flash_until =
+                                        Some(Instant::now() + Duration::from_millis(RESET_FLASH_MS));
+                                }
+                                autosave_ui_settings(settings, &mut last_decode);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if is_quit || is_ctrl_c {
+                        break;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    terminal.autoresize().ok();
+                    terminal.clear().ok();
+                }
+                _ => {}
             }
         }
     }
@@ -595,13 +749,36 @@ struct SshServeConfig {
     tx_interval_ms: u64,
 }
 
+struct MdnsRegistration {
+    daemon: ServiceDaemon,
+    service_fullname: String,
+}
+
+impl MdnsRegistration {
+    fn shutdown_graceful(self) {
+        if let Ok(rx) = self.daemon.unregister(&self.service_fullname) {
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
+        if let Ok(rx) = self.daemon.shutdown() {
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
+    }
+}
+
 #[derive(Debug)]
 struct UiState {
     frames: VecDeque<Frame>,
     last_decode: String,
-    latest_db: Option<f32>,
-    display_db: Option<f32>,
+    latest_peak_db: Option<f32>,
+    display_peak_db: Option<f32>,
+    latest_rms_db: Option<f32>,
+    display_rms_db: Option<f32>,
+    display_mode: DisplayMode,
     last_big_update: Instant,
+    settings: UiSettings,
+    show_menu: bool,
+    selected_field: MenuField,
+    reset_flash_until: Option<Instant>,
 }
 
 type SshTerminal = Terminal<CrosstermBackend<SshTerminalHandle>>;
@@ -722,11 +899,20 @@ impl russh::server::Handler for SshAppServer {
                 } else {
                     String::from("waiting for device data...")
                 },
-                latest_db: None,
-                display_db: None,
+                latest_peak_db: None,
+                display_peak_db: None,
+                latest_rms_db: None,
+                display_rms_db: None,
+                display_mode: DisplayMode::Peak,
                 last_big_update: Instant::now()
                     .checked_sub(Duration::from_millis(BIG_TEXT_UPDATE_MS))
                     .unwrap_or_else(Instant::now),
+                // Keep SSH client settings session-local so one client's changes
+                // do not carry over to other sessions.
+                settings: UiSettings::default(),
+                show_menu: false,
+                selected_field: MenuField::Limit,
+                reset_flash_until: None,
             },
         };
         draw_ui(
@@ -734,9 +920,16 @@ impl russh::server::Handler for SshAppServer {
             self.cfg.vid,
             self.cfg.pid,
             &client.state.last_decode,
-            client.state.display_db,
+            client.state.display_peak_db,
+            client.state.display_rms_db,
+            client.state.display_mode,
             &client.state.frames,
             true,
+            client.state.settings,
+            client.state.show_menu,
+            client.state.selected_field,
+            client.state.reset_flash_until,
+            Some(&self.cfg.host),
         )?;
 
         self.clients.lock().await.insert(self.id, client);
@@ -766,20 +959,30 @@ impl russh::server::Handler for SshAppServer {
         let _ = session.channel_success(channel);
         let mut clients = self.clients.lock().await;
         if let Some(client) = clients.get_mut(&self.id) {
+            let width = col_width.clamp(1, u16::MAX as u32) as u16;
+            let height = row_height.clamp(1, u16::MAX as u32) as u16;
             client.terminal.resize(ratatui::layout::Rect {
                 x: 0,
                 y: 0,
-                width: col_width as u16,
-                height: row_height as u16,
+                width,
+                height,
             })?;
+            client.terminal.clear()?;
             draw_ui(
                 &mut client.terminal,
                 self.cfg.vid,
                 self.cfg.pid,
                 &client.state.last_decode,
-                client.state.display_db,
+                client.state.display_peak_db,
+                client.state.display_rms_db,
+                client.state.display_mode,
                 &client.state.frames,
                 true,
+                client.state.settings,
+                client.state.show_menu,
+                client.state.selected_field,
+                client.state.reset_flash_until,
+                Some(&self.cfg.host),
             )?;
         }
         Ok(())
@@ -796,20 +999,30 @@ impl russh::server::Handler for SshAppServer {
     ) -> Result<(), Self::Error> {
         let mut clients = self.clients.lock().await;
         if let Some(client) = clients.get_mut(&self.id) {
+            let width = col_width.clamp(1, u16::MAX as u32) as u16;
+            let height = row_height.clamp(1, u16::MAX as u32) as u16;
             client.terminal.resize(ratatui::layout::Rect {
                 x: 0,
                 y: 0,
-                width: col_width as u16,
-                height: row_height as u16,
+                width,
+                height,
             })?;
+            client.terminal.clear()?;
             draw_ui(
                 &mut client.terminal,
                 self.cfg.vid,
                 self.cfg.pid,
                 &client.state.last_decode,
-                client.state.display_db,
+                client.state.display_peak_db,
+                client.state.display_rms_db,
+                client.state.display_mode,
                 &client.state.frames,
                 true,
+                client.state.settings,
+                client.state.show_menu,
+                client.state.selected_field,
+                client.state.reset_flash_until,
+                Some(&self.cfg.host),
             )?;
         }
         Ok(())
@@ -824,6 +1037,51 @@ impl russh::server::Handler for SshAppServer {
         if data.contains(&b'q') || data.contains(&3) {
             self.clients.lock().await.remove(&self.id);
             let _ = session.close(channel);
+            return Ok(());
+        }
+        let mut clients = self.clients.lock().await;
+        if let Some(client) = clients.get_mut(&self.id) {
+            for b in data {
+                match *b {
+                    b'm' | b'M' => client.state.show_menu = !client.state.show_menu,
+                    b'\t' => {
+                        if client.state.show_menu {
+                            client.state.selected_field = client.state.selected_field.next();
+                        }
+                    }
+                    b'+' | b'=' => {
+                        if client.state.show_menu {
+                            let did_reset = adjust_setting(
+                                &mut client.state.settings,
+                                &mut client.state.display_mode,
+                                client.state.selected_field,
+                                1.0,
+                            );
+                            if did_reset {
+                                client.state.reset_flash_until =
+                                    Some(Instant::now() + Duration::from_millis(RESET_FLASH_MS));
+                            }
+                            client.state.last_decode = "updated session settings".to_string();
+                        }
+                    }
+                    b'-' => {
+                        if client.state.show_menu {
+                            let did_reset = adjust_setting(
+                                &mut client.state.settings,
+                                &mut client.state.display_mode,
+                                client.state.selected_field,
+                                -1.0,
+                            );
+                            if did_reset {
+                                client.state.reset_flash_until =
+                                    Some(Instant::now() + Duration::from_millis(RESET_FLASH_MS));
+                            }
+                            client.state.last_decode = "updated session settings".to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
     }
@@ -835,21 +1093,19 @@ impl russh::server::Handler for SshAppServer {
 }
 
 async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
+    let host_key = load_or_create_ssh_host_key()?;
     let ssh_cfg = russh::server::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         auth_rejection_time: Duration::from_secs(1),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        keys: vec![
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-                .map_err(|e| anyhow::anyhow!("failed generating server host key: {e}"))?,
-        ],
+        keys: vec![host_key],
         ..Default::default()
     };
     let ssh_cfg = Arc::new(ssh_cfg);
 
     let mut server = SshAppServer::new(cfg.clone());
     let clients = server.clients.clone();
-    let mdns_daemon = if cfg.mdns {
+    let mdns_registration = if cfg.mdns {
         Some(setup_mdns(&cfg)?)
     } else {
         None
@@ -865,6 +1121,7 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
         frame_tx.clone(),
     );
 
+    let host_for_ui = cfg.host.clone();
     tokio::spawn(async move {
         let mut rx = frame_tx.subscribe();
         while let Ok(frame) = rx.recv().await {
@@ -874,14 +1131,18 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
                 if let Some(decoded) = &frame.decoded {
                     client.state.last_decode = decoded.clone();
                 }
-                if let Some(db) = frame.db {
-                    client.state.latest_db = Some(db);
+                if let Some(peak_db) = frame.db {
+                    client.state.latest_peak_db = Some(peak_db);
+                }
+                if let Some(rms_db) = frame.rms_db {
+                    client.state.latest_rms_db = Some(rms_db);
                 }
                 if client.state.last_big_update.elapsed()
                     >= Duration::from_millis(BIG_TEXT_UPDATE_MS)
-                    && client.state.latest_db.is_some()
+                    && (client.state.latest_rms_db.is_some() || client.state.latest_peak_db.is_some())
                 {
-                    client.state.display_db = client.state.latest_db;
+                    client.state.display_peak_db = client.state.latest_peak_db;
+                    client.state.display_rms_db = client.state.latest_rms_db;
                     client.state.last_big_update = Instant::now();
                 }
                 while client.state.frames.len() > MAX_UI_FRAMES {
@@ -892,9 +1153,16 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
                     cfg.vid,
                     cfg.pid,
                     &client.state.last_decode,
-                    client.state.display_db,
+                    client.state.display_peak_db,
+                    client.state.display_rms_db,
+                    client.state.display_mode,
                     &client.state.frames,
                     true,
+                    client.state.settings,
+                    client.state.show_menu,
+                    client.state.selected_field,
+                    client.state.reset_flash_until,
+                    Some(&host_for_ui),
                 );
             }
         }
@@ -939,12 +1207,14 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
     let result = server
         .run_on_address(ssh_cfg, (cfg.host.as_str(), cfg.port))
         .await;
-    drop(mdns_daemon);
+    if let Some(mdns) = mdns_registration {
+        mdns.shutdown_graceful();
+    }
     result?;
     Ok(())
 }
 
-fn setup_mdns(cfg: &SshServeConfig) -> Result<ServiceDaemon> {
+fn setup_mdns(cfg: &SshServeConfig) -> Result<MdnsRegistration> {
     let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
     let service_type = "_ssh._tcp.local.";
     let instance_name = cfg.mdns_name.clone();
@@ -960,9 +1230,13 @@ fn setup_mdns(cfg: &SshServeConfig) -> Result<ServiceDaemon> {
         &properties[..],
     )
     .context("failed to build mDNS service info")?;
+    let service_fullname = service_info.get_fullname().to_string();
     mdns.register(service_info)
         .context("failed to register mDNS service")?;
-    Ok(mdns)
+    Ok(MdnsRegistration {
+        daemon: mdns,
+        service_fullname,
+    })
 }
 
 fn discover_local_ip() -> std::net::IpAddr {
@@ -991,13 +1265,16 @@ fn spawn_hid_worker(
     frame_tx: broadcast::Sender<Frame>,
 ) {
     std::thread::spawn(move || {
+        let mut rolling_rms = RollingRms::new(RMS_WINDOW_SAMPLES);
         if demo {
             let demo_start = Instant::now();
             loop {
                 let db = synthetic_db(demo_start);
+                let rms_db = rolling_rms.push_db(db);
                 let _ = frame_tx.send(Frame {
-                    decoded: Some(format!("demo current={db:.1} dB")),
+                    decoded: Some(format!("demo current={db:.1} dB rms={rms_db:.1} dB")),
                     db: Some(db),
+                    rms_db: Some(rms_db),
                 });
                 std::thread::sleep(Duration::from_millis(DEMO_SAMPLE_MS));
             }
@@ -1009,6 +1286,7 @@ fn spawn_hid_worker(
                 let _ = frame_tx.send(Frame {
                     decoded: Some(format!("HID init error: {e}")),
                     db: None,
+                    rms_db: None,
                 });
                 return;
             }
@@ -1021,6 +1299,7 @@ fn spawn_hid_worker(
                         "Device open error VID=0x{vid:04X} PID=0x{pid:04X}: {e}"
                     )),
                     db: None,
+                    rms_db: None,
                 });
                 return;
             }
@@ -1039,10 +1318,12 @@ fn spawn_hid_worker(
                     Ok(_) => Frame {
                         decoded: Some("TX probe".to_string()),
                         db: None,
+                        rms_db: None,
                     },
                     Err(e) => Frame {
                         decoded: Some(format!("TX error: {e}")),
                         db: None,
+                        rms_db: None,
                     },
                 };
                 let _ = frame_tx.send(event);
@@ -1054,13 +1335,15 @@ fn spawn_hid_worker(
                     let bytes = buf[..n].to_vec();
                     let decoded = decode_frame(&bytes);
                     let db = extract_db(&bytes);
-                    let _ = frame_tx.send(Frame { decoded, db });
+                    let rms_db = db.map(|v| rolling_rms.push_db(v));
+                    let _ = frame_tx.send(Frame { decoded, db, rms_db });
                 }
                 Ok(_) => {}
                 Err(e) => {
                     let _ = frame_tx.send(Frame {
                         decoded: Some(format!("Read error: {e}")),
                         db: None,
+                        rms_db: None,
                     });
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -1071,19 +1354,30 @@ fn spawn_hid_worker(
 
 fn draw_ui<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    vid: u16,
-    pid: u16,
+    _vid: u16,
+    _pid: u16,
     last_decode: &str,
-    display_db: Option<f32>,
+    display_peak_db: Option<f32>,
+    display_rms_db: Option<f32>,
+    display_mode: DisplayMode,
     frames: &VecDeque<Frame>,
     ssh_mode: bool,
+    settings: UiSettings,
+    show_menu: bool,
+    selected_field: MenuField,
+    reset_flash_until: Option<Instant>,
+    ssh_host: Option<&str>,
 ) -> Result<()> {
     terminal
         .draw(|f| {
-            let mode_note = if ssh_mode { "ssh" } else { "local" };
-            let title = format!(
-                "Volume History  VID=0x{vid:04X} PID=0x{pid:04X}  mode={mode_note}  q/Ctrl+C=quit"
-            );
+            let title = if ssh_mode {
+                let host = ssh_host
+                    .map(resolve_display_host)
+                    .unwrap_or_else(|| discover_local_ip().to_string());
+                format!("ssh-soundmeter  quit:q/Ctrl+C  menu:m  host:{host}")
+            } else {
+                "ssh-soundmeter  quit:q/Ctrl+C  menu:m".to_string()
+            };
             let block = Block::default().borders(Borders::ALL).title(title);
             let area = f.area();
             let inner = block.inner(area);
@@ -1093,16 +1387,31 @@ fn draw_ui<B: ratatui::backend::Backend>(
                 return;
             }
 
-            let (cols, current_db, center_col) = history_columns(frames, inner.width as usize);
-            let lines = build_graph_lines(&cols, inner.height as usize, center_col);
+            let (cols, center_col) = history_columns(frames, inner.width as usize);
+            let lines = build_graph_lines(
+                &cols,
+                inner.height as usize,
+                center_col,
+                settings.graph_min_db,
+                settings.graph_max_db,
+            );
             f.render_widget(Paragraph::new(lines), inner);
 
-            let shown_db = display_db.or(current_db);
+            let shown_db = match display_mode {
+                DisplayMode::Rms => display_rms_db,
+                DisplayMode::Peak => display_peak_db,
+            };
             let current_text = shown_db
                 .map(|db| format!("{db:.1}"))
                 .unwrap_or_else(|| "n/a".to_string());
-            let scale = compute_big_scale(inner.width, inner.height, &current_text);
-            let (big_w, big_h) = big_text_size(&current_text, scale);
+            let over_limit = shown_db.map(|db| db >= settings.limit_db).unwrap_or(false);
+            let mut scale = fit_big_scale(inner.width, inner.height, &current_text);
+            let (mut big_w, mut big_h) = big_text_size(&current_text, scale);
+            if big_w.saturating_add(2) > inner.width || big_h.saturating_add(2) > inner.height {
+                scale = 0;
+                big_w = current_text.len() as u16;
+                big_h = 1;
+            }
             let tx = inner
                 .x
                 .saturating_add(inner.width / 2)
@@ -1111,23 +1420,41 @@ fn draw_ui<B: ratatui::backend::Backend>(
                 .y
                 .saturating_add(inner.height / 2)
                 .saturating_sub(big_h / 2);
-            render_big_text(
-                f,
-                tx,
-                ty,
-                &current_text,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-                scale,
-            );
+            if scale > 0 {
+                render_big_text(
+                    f,
+                    tx,
+                    ty,
+                    &current_text,
+                    Style::default()
+                        .fg(if over_limit { Color::Red } else { Color::White })
+                        .add_modifier(Modifier::BOLD),
+                    scale,
+                    over_limit,
+                );
+            } else {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        current_text.clone(),
+                        Style::default()
+                            .fg(if over_limit { Color::Red } else { Color::White })
+                            .add_modifier(Modifier::BOLD),
+                    ))),
+                    Rect {
+                        x: tx,
+                        y: ty,
+                        width: big_w.min(inner.width),
+                        height: 1,
+                    },
+                );
+            }
 
-            let unit = "dB";
+            let unit = display_mode.unit_label();
             let ux = inner
                 .x
                 .saturating_add(inner.width / 2)
                 .saturating_sub((unit.len() as u16) / 2);
-            let uy = ty.saturating_add(big_h).saturating_add(1);
+            let uy = ty.saturating_add(big_h).saturating_add(if scale > 0 { 1 } else { 0 });
             if uy < inner.y.saturating_add(inner.height) {
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
@@ -1158,6 +1485,55 @@ fn draw_ui<B: ratatui::backend::Backend>(
                     status_rect,
                 );
             }
+
+            if show_menu {
+                if inner.width < 24 || inner.height < 8 {
+                    return;
+                }
+                let mark = |field: MenuField| if selected_field == field { '*' } else { ' ' };
+                let now = Instant::now();
+                let reset_flashing = reset_flash_until.is_some_and(|until| until > now);
+                let reset_flash_on = reset_flash_until
+                    .map(|until| until.saturating_duration_since(now).as_millis() / 120 % 2 == 0)
+                    .unwrap_or(false);
+                let reset_mark = if reset_flashing && reset_flash_on {
+                    '*'
+                } else {
+                    mark(MenuField::ResetDefaults)
+                };
+                let reset_text = if reset_flashing && reset_flash_on {
+                    "RESET: DEFAULTS"
+                } else {
+                    "reset: defaults"
+                };
+                let menu_text = format!(
+                    "{} limit: {:.1} dB\n{} min: {:.1} dB\n{} max: {:.1} dB\n{} view: {}\n{} {}\nTab: next  +/-: adjust  m: close",
+                    mark(MenuField::Limit),
+                    settings.limit_db,
+                    mark(MenuField::GraphMin),
+                    settings.graph_min_db,
+                    mark(MenuField::GraphMax),
+                    settings.graph_max_db,
+                    mark(MenuField::ViewMode),
+                    display_mode.label(),
+                    reset_mark,
+                    reset_text,
+                );
+                let menu_w = 42u16;
+                let menu_rect = Rect {
+                    x: inner.x.saturating_add(1),
+                    y: inner.y.saturating_add(1),
+                    width: menu_w.min(inner.width.saturating_sub(2)),
+                    height: 8.min(inner.height.saturating_sub(2)),
+                };
+                let menu = Paragraph::new(menu_text).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Menu")
+                        .style(Style::default().fg(Color::White).bg(Color::Black)),
+                );
+                f.render_widget(menu, menu_rect);
+            }
         })
         .map_err(|e| anyhow::anyhow!("terminal draw failed: {e:?}"))?;
     Ok(())
@@ -1165,25 +1541,53 @@ fn draw_ui<B: ratatui::backend::Backend>(
 
 fn synthetic_db(start: Instant) -> f32 {
     let t = start.elapsed().as_secs_f32();
-    let wave = 62.0 + (t * 1.3).sin() * 12.0 + (t * 0.37).sin() * 7.0;
-    let burst = if (t * 0.85).sin() > 0.93 {
-        18.0 * (t * 8.0).sin().abs()
-    } else {
-        0.0
-    };
-    (wave + burst).clamp(32.0, 108.0)
+    let base = 58.0 + (t * 2.7).sin() * 10.0 + (t * 6.9).sin() * 12.0 + (t * 13.1).sin() * 6.0;
+    let pulse = if (t * 1.7).sin() > 0.65 { 22.0 } else { 0.0 };
+    let random_like = (((t * 23.0).sin() * 43758.5453).fract().abs() - 0.5) * 10.0;
+    let dip = if (t * 0.47).sin() < -0.92 { -14.0 } else { 0.0 };
+    (base + pulse + random_like + dip).clamp(28.0, 112.0)
+}
+
+#[derive(Debug)]
+struct RollingRms {
+    cap: usize,
+    powers: VecDeque<f64>,
+    sum_power: f64,
+}
+
+impl RollingRms {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            powers: VecDeque::with_capacity(cap.max(1)),
+            sum_power: 0.0,
+        }
+    }
+
+    fn push_db(&mut self, db: f32) -> f32 {
+        let power = 10f64.powf((db as f64) / 10.0);
+        self.powers.push_back(power);
+        self.sum_power += power;
+        if self.powers.len() > self.cap
+            && let Some(old) = self.powers.pop_front()
+        {
+            self.sum_power -= old;
+        }
+        let n = self.powers.len().max(1) as f64;
+        let mean_power = (self.sum_power / n).max(1e-12);
+        (10.0 * mean_power.log10()) as f32
+    }
 }
 
 fn history_columns(
     frames: &VecDeque<Frame>,
     width: usize,
-) -> (Vec<Option<f32>>, Option<f32>, usize) {
-    let width = width.max(11);
+) -> (Vec<Option<f32>>, usize) {
+    let width = width.max(1);
     let center = width.saturating_sub(1);
     let mut cols: Vec<Option<f32>> = vec![None; width];
     let history: Vec<f32> = frames.iter().filter_map(|f| f.db).collect();
-    let current = history.first().copied();
-    cols[center] = current;
+    cols[center] = history.first().copied();
 
     for i in 1..width {
         if let Some(v) = history.get(i) {
@@ -1192,14 +1596,23 @@ fn history_columns(
             break;
         }
     }
-    (cols, current, center)
+    (cols, center)
 }
 
-fn build_graph_lines(cols: &[Option<f32>], height: usize, center_col: usize) -> Vec<Line<'static>> {
+fn build_graph_lines(
+    cols: &[Option<f32>],
+    height: usize,
+    center_col: usize,
+    graph_min_db: f32,
+    graph_max_db: f32,
+) -> Vec<Line<'static>> {
     let cols = smooth_columns(cols);
     let heights: Vec<usize> = cols
         .iter()
-        .map(|v| v.map(|db| db_to_rows(db, height)).unwrap_or(0))
+        .map(|v| {
+            v.map(|db| db_to_rows(db, height, graph_min_db, graph_max_db))
+                .unwrap_or(0)
+        })
         .collect();
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     for y in 0..height {
@@ -1211,13 +1624,13 @@ fn build_graph_lines(cols: &[Option<f32>], height: usize, center_col: usize) -> 
             if h > 0 {
                 let line_y = height.saturating_sub(h);
                 if y >= line_y {
-                    ch = '󰇝';
+                    ch = GRAPH_FILL_CHAR;
                     style = style.fg(gradient_color_for_row(y, height));
                 }
             }
 
             if x == center_col && ch == ' ' {
-                ch = '┊';
+                ch = GRAPH_CENTER_CHAR;
                 style = style.fg(Color::DarkGray);
             }
 
@@ -1262,11 +1675,12 @@ fn smooth_columns(cols: &[Option<f32>]) -> Vec<Option<f32>> {
     out
 }
 
-fn db_to_rows(db: f32, height: usize) -> usize {
+fn db_to_rows(db: f32, height: usize, graph_min_db: f32, graph_max_db: f32) -> usize {
     if height == 0 {
         return 0;
     }
-    let normalized = ((db - CHART_DB_MIN) / (CHART_DB_MAX - CHART_DB_MIN)).clamp(0.0, 1.0);
+    let denom = (graph_max_db - graph_min_db).max(1.0);
+    let normalized = ((db - graph_min_db) / denom).clamp(0.0, 1.0);
     ((normalized * height as f32).round() as usize).clamp(0, height)
 }
 
@@ -1297,6 +1711,138 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
+fn adjust_setting(
+    settings: &mut UiSettings,
+    display_mode: &mut DisplayMode,
+    field: MenuField,
+    delta: f32,
+) -> bool {
+    match field {
+        MenuField::Limit => {
+            settings.limit_db = (settings.limit_db + delta).clamp(30.0, settings.graph_max_db);
+            settings.limit_db = settings.limit_db.max(settings.graph_min_db);
+            false
+        }
+        MenuField::GraphMin => {
+            settings.graph_min_db =
+                (settings.graph_min_db + delta).clamp(10.0, settings.graph_max_db - 1.0);
+            settings.limit_db = settings.limit_db.max(settings.graph_min_db);
+            false
+        }
+        MenuField::GraphMax => {
+            settings.graph_max_db =
+                (settings.graph_max_db + delta).clamp(settings.graph_min_db + 1.0, 140.0);
+            settings.limit_db = settings.limit_db.min(settings.graph_max_db);
+            false
+        }
+        MenuField::ViewMode => {
+            *display_mode = display_mode.toggle();
+            false
+        }
+        MenuField::ResetDefaults => {
+            *settings = UiSettings::default();
+            *display_mode = DisplayMode::Peak;
+            true
+        }
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = std::env::var("HOMEDRIVE").ok()?;
+            let path = std::env::var("HOMEPATH").ok()?;
+            let combined = format!("{drive}{path}");
+            if combined.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(combined))
+            }
+        })
+}
+
+fn settings_path() -> PathBuf {
+    home_dir()
+        .map(|p| p.join(".ssh-soundmeter-settings"))
+        .unwrap_or_else(|| PathBuf::from(".ssh-soundmeter-settings"))
+}
+
+fn host_key_path() -> PathBuf {
+    home_dir()
+        .map(|p| p.join(".ssh-soundmeter-hostkey"))
+        .unwrap_or_else(|| PathBuf::from(".ssh-soundmeter-hostkey"))
+}
+
+fn load_or_create_ssh_host_key() -> Result<PrivateKey> {
+    let path = host_key_path();
+    if path.exists() {
+        return PrivateKey::read_openssh_file(&path)
+            .with_context(|| format!("failed reading SSH host key {}", path.display()));
+    }
+
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        .map_err(|e| anyhow::anyhow!("failed generating server host key: {e}"))?;
+    key.write_openssh_file(&path, ssh_key::LineEnding::LF)
+        .with_context(|| format!("failed writing SSH host key {}", path.display()))?;
+    Ok(key)
+}
+
+fn load_ui_settings() -> Option<UiSettings> {
+    let path = settings_path();
+    let content = fs::read_to_string(path).ok()?;
+    let mut out = UiSettings::default();
+    for line in content.lines() {
+        let mut parts = line.splitn(2, '=');
+        let key = parts.next()?.trim();
+        let val = parts.next()?.trim().parse::<f32>().ok()?;
+        match key {
+            "limit_db" => out.limit_db = val,
+            "graph_min_db" => out.graph_min_db = val,
+            "graph_max_db" => out.graph_max_db = val,
+            _ => {}
+        }
+    }
+    if out.graph_max_db <= out.graph_min_db {
+        return None;
+    }
+    out.limit_db = out.limit_db.clamp(out.graph_min_db, out.graph_max_db);
+    Some(out)
+}
+
+fn save_ui_settings(settings: UiSettings) -> Result<PathBuf> {
+    let path = settings_path();
+    let data = format!(
+        "limit_db={:.1}\ngraph_min_db={:.1}\ngraph_max_db={:.1}\n",
+        settings.limit_db, settings.graph_min_db, settings.graph_max_db
+    );
+    fs::write(&path, data).with_context(|| format!("failed writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn autosave_ui_settings(settings: UiSettings, last_decode: &mut String) {
+    *last_decode = match save_ui_settings(settings) {
+        Ok(path) => format!("saved settings to {}", path.display()),
+        Err(e) => format!("save failed: {e}"),
+    };
+}
+
+fn resolve_display_host(host: &str) -> String {
+    if host == "0.0.0.0" || host == "::" {
+        discover_local_ip().to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
     let base_h = 5u16;
     let mut base_w = 0u16;
@@ -1315,6 +1861,18 @@ fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
     by_w.min(by_h).clamp(1, 4)
 }
 
+fn fit_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
+    let mut scale = compute_big_scale(inner_w, inner_h, text);
+    while scale > 1 {
+        let (w, h) = big_text_size(text, scale);
+        if w.saturating_add(2) <= inner_w && h.saturating_add(2) <= inner_h {
+            break;
+        }
+        scale -= 1;
+    }
+    scale
+}
+
 fn big_text_size(text: &str, scale: u16) -> (u16, u16) {
     let mut width = 0u16;
     for ch in text.chars() {
@@ -1322,10 +1880,7 @@ fn big_text_size(text: &str, scale: u16) -> (u16, u16) {
         width = width.saturating_add((glyph[0].chars().count() as u16).saturating_mul(scale));
         width = width.saturating_add(scale);
     }
-    (
-        width.saturating_sub(scale),
-        5u16.saturating_mul(scale),
-    )
+    (width.saturating_sub(scale), 5u16.saturating_mul(scale))
 }
 
 fn render_big_text(
@@ -1335,11 +1890,18 @@ fn render_big_text(
     text: &str,
     style: Style,
     scale: u16,
+    over_limit: bool,
 ) {
     if text.is_empty() {
         return;
     }
-    let mut rows = vec![String::new(), String::new(), String::new(), String::new(), String::new()];
+    let mut rows = vec![
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ];
     for ch in text.chars() {
         let glyph = big_glyph(ch);
         for i in 0..5 {
@@ -1353,11 +1915,20 @@ fn render_big_text(
             }
         }
     }
+    let total_h = (rows.len() as u16).saturating_mul(scale).max(1);
     for (i, row) in rows.iter().enumerate() {
         for sy in 0..scale {
-            let out_y = y.saturating_add((i as u16).saturating_mul(scale)).saturating_add(sy);
+            let out_y = y
+                .saturating_add((i as u16).saturating_mul(scale))
+                .saturating_add(sy);
+            let rel_y = (i as u16).saturating_mul(scale).saturating_add(sy) as usize;
+            let row_style = if over_limit {
+                style.fg(Color::Red)
+            } else {
+                style.fg(subtle_text_gradient(rel_y, total_h as usize))
+            };
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(row.clone(), style))),
+                Paragraph::new(Line::from(Span::styled(row.clone(), row_style))),
                 Rect {
                     x,
                     y: out_y,
@@ -1367,6 +1938,17 @@ fn render_big_text(
             );
         }
     }
+}
+
+fn subtle_text_gradient(y: usize, height: usize) -> Color {
+    if height <= 1 {
+        return Color::White;
+    }
+    let t = y as f32 / (height - 1) as f32;
+    let r = lerp_u8(255, 160, t);
+    let g = lerp_u8(255, 172, t);
+    let b = lerp_u8(255, 196, t);
+    Color::Rgb(r, g, b)
 }
 
 fn big_glyph(ch: char) -> [&'static str; 5] {
