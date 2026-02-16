@@ -37,8 +37,8 @@ const DEMO_SAMPLE_MS: u64 = 120;
 const BIG_TEXT_UPDATE_MS: u64 = 400;
 const RMS_WINDOW_SAMPLES: usize = 32;
 const RESET_FLASH_MS: u64 = 900;
-const GRAPH_FILL_CHAR: char = '=';
-const GRAPH_CENTER_CHAR: char = '|';
+const GRAPH_FILL_CHAR: char = '═';
+const GRAPH_CENTER_CHAR: char = '│';
 
 #[derive(Clone, Copy, Debug)]
 struct UiSettings {
@@ -1378,7 +1378,9 @@ fn draw_ui<B: ratatui::backend::Backend>(
             } else {
                 "ssh-soundmeter  quit:q/Ctrl+C  menu:m".to_string()
             };
-            let block = Block::default().borders(Borders::ALL).title(title);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(title);
             let area = f.area();
             let inner = block.inner(area);
             f.render_widget(block, area);
