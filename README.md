@@ -45,13 +45,36 @@ cargo run -- sniff --vid 0x64BD --pid 0x74E3 --tx "00 01 02 03" --tx-interval-ms
 cargo run -- tui --vid 0x64BD --pid 0x74E3
 ```
 
-5. Run the same UI over SSH:
+Demo UI without hardware:
 
 ```bash
-ssh user@host "cd /path/to/rust-soundmeter && cargo run --release -- tui --vid 0x64BD --pid 0x74E3"
+cargo run -- tui --demo true
 ```
 
-`ratatui` renders in any normal PTY, so a built-in SSH server is not required unless you want multi-user/auth logic inside the app itself.
+5. Run the built-in SSH server with mDNS (`soundmeter.local`):
+
+```bash
+cargo run -- serve-ssh --host 0.0.0.0 --port 22 --mdns --mdns-name soundmeter --vid 0x64BD --pid 0x74E3
+```
+
+Demo SSH-hosted UI without hardware:
+
+```bash
+cargo run -- serve-ssh --demo true
+```
+
+Then connect from another machine on the same LAN:
+
+```bash
+ssh soundmeter.local
+```
+
+Notes:
+- `open_access` is enabled by default, so any username/password is accepted.
+- If you keep a non-standard port, include `-p` in your SSH command.
+- If mDNS does not resolve on your network, use direct IP.
+
+Press `q` in the SSH session to close that client session.
 
 ## Next reverse-engineering step
 
