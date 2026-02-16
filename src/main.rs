@@ -6,17 +6,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use clap::{ArgAction, Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::executor;
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use russh::keys::ssh_key;
 use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey};
@@ -29,8 +29,10 @@ const DEFAULT_PID: u16 = 0x74E3;
 const HID_READ_TIMEOUT_MS: i32 = 200;
 const MAX_FRAME_BYTES: usize = 64;
 const MAX_UI_FRAMES: usize = 200;
-const CHART_DB_MAX: u64 = 120;
+const CHART_DB_MAX: f32 = 120.0;
+const CHART_DB_MIN: f32 = 20.0;
 const DEMO_SAMPLE_MS: u64 = 120;
+const BIG_TEXT_UPDATE_MS: u64 = 400;
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-soundmeter")]
@@ -116,8 +118,6 @@ enum Command {
 
 #[derive(Clone, Debug)]
 struct Frame {
-    ts: chrono::DateTime<Local>,
-    bytes: Vec<u8>,
     decoded: Option<String>,
     db: Option<f32>,
 }
@@ -327,6 +327,11 @@ fn run_tui_loop(
     } else {
         String::from("n/a")
     };
+    let mut latest_db: Option<f32> = None;
+    let mut display_db: Option<f32> = None;
+    let mut last_big_update = Instant::now()
+        .checked_sub(Duration::from_millis(BIG_TEXT_UPDATE_MS))
+        .unwrap_or_else(Instant::now);
     let demo_start = Instant::now();
     let mut last_demo_emit = Instant::now()
         .checked_sub(Duration::from_millis(DEMO_SAMPLE_MS))
@@ -341,15 +346,11 @@ fn run_tui_loop(
                 && let Err(e) = write_frame(dev, tx)
             {
                 frames.push_front(Frame {
-                    ts: Local::now(),
-                    bytes: tx.to_vec(),
                     decoded: Some(format!("TX error: {e}")),
                     db: None,
                 });
             } else {
                 frames.push_front(Frame {
-                    ts: Local::now(),
-                    bytes: tx.to_vec(),
                     decoded: Some("TX probe".to_string()),
                     db: None,
                 });
@@ -365,9 +366,8 @@ fn run_tui_loop(
                 let db = synthetic_db(demo_start);
                 let decoded = Some(format!("demo current={db:.1} dB"));
                 last_decode = decoded.clone().unwrap_or_else(|| "n/a".to_string());
+                latest_db = Some(db);
                 frames.push_front(Frame {
-                    ts: Local::now(),
-                    bytes: Vec::new(),
                     decoded,
                     db: Some(db),
                 });
@@ -385,12 +385,10 @@ fn run_tui_loop(
                     if let Some(ref d) = decoded {
                         last_decode = d.clone();
                     }
-                    frames.push_front(Frame {
-                        ts: Local::now(),
-                        bytes: data,
-                        decoded,
-                        db,
-                    });
+                    if let Some(v) = db {
+                        latest_db = Some(v);
+                    }
+                    frames.push_front(Frame { decoded, db });
                     while frames.len() > MAX_UI_FRAMES {
                         frames.pop_back();
                     }
@@ -398,8 +396,6 @@ fn run_tui_loop(
                 Ok(_) => {}
                 Err(e) => {
                     frames.push_front(Frame {
-                        ts: Local::now(),
-                        bytes: Vec::new(),
                         decoded: Some(format!("Read error: {e}")),
                         db: None,
                     });
@@ -410,13 +406,24 @@ fn run_tui_loop(
             }
         }
 
-        draw_ui(terminal, vid, pid, &last_decode, &frames, false)?;
+        if last_big_update.elapsed() >= Duration::from_millis(BIG_TEXT_UPDATE_MS)
+            && latest_db.is_some()
+        {
+            display_db = latest_db;
+            last_big_update = Instant::now();
+        }
+
+        draw_ui(terminal, vid, pid, &last_decode, display_db, &frames, false)?;
 
         if event::poll(Duration::from_millis(10)).context("event poll failed")?
             && let Event::Key(k) = event::read().context("event read failed")?
-            && k.code == KeyCode::Char('q')
         {
-            break;
+            let is_quit = k.code == KeyCode::Char('q');
+            let is_ctrl_c =
+                k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
+            if is_quit || is_ctrl_c {
+                break;
+            }
         }
     }
 
@@ -588,10 +595,13 @@ struct SshServeConfig {
     tx_interval_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UiState {
     frames: VecDeque<Frame>,
     last_decode: String,
+    latest_db: Option<f32>,
+    display_db: Option<f32>,
+    last_big_update: Instant,
 }
 
 type SshTerminal = Terminal<CrosstermBackend<SshTerminalHandle>>;
@@ -712,6 +722,11 @@ impl russh::server::Handler for SshAppServer {
                 } else {
                     String::from("waiting for device data...")
                 },
+                latest_db: None,
+                display_db: None,
+                last_big_update: Instant::now()
+                    .checked_sub(Duration::from_millis(BIG_TEXT_UPDATE_MS))
+                    .unwrap_or_else(Instant::now),
             },
         };
         draw_ui(
@@ -719,6 +734,7 @@ impl russh::server::Handler for SshAppServer {
             self.cfg.vid,
             self.cfg.pid,
             &client.state.last_decode,
+            client.state.display_db,
             &client.state.frames,
             true,
         )?;
@@ -761,6 +777,7 @@ impl russh::server::Handler for SshAppServer {
                 self.cfg.vid,
                 self.cfg.pid,
                 &client.state.last_decode,
+                client.state.display_db,
                 &client.state.frames,
                 true,
             )?;
@@ -790,6 +807,7 @@ impl russh::server::Handler for SshAppServer {
                 self.cfg.vid,
                 self.cfg.pid,
                 &client.state.last_decode,
+                client.state.display_db,
                 &client.state.frames,
                 true,
             )?;
@@ -821,8 +839,10 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         auth_rejection_time: Duration::from_secs(1),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        keys: vec![PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-            .map_err(|e| anyhow::anyhow!("failed generating server host key: {e}"))?],
+        keys: vec![
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                .map_err(|e| anyhow::anyhow!("failed generating server host key: {e}"))?,
+        ],
         ..Default::default()
     };
     let ssh_cfg = Arc::new(ssh_cfg);
@@ -854,6 +874,16 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
                 if let Some(decoded) = &frame.decoded {
                     client.state.last_decode = decoded.clone();
                 }
+                if let Some(db) = frame.db {
+                    client.state.latest_db = Some(db);
+                }
+                if client.state.last_big_update.elapsed()
+                    >= Duration::from_millis(BIG_TEXT_UPDATE_MS)
+                    && client.state.latest_db.is_some()
+                {
+                    client.state.display_db = client.state.latest_db;
+                    client.state.last_big_update = Instant::now();
+                }
                 while client.state.frames.len() > MAX_UI_FRAMES {
                     client.state.frames.pop_back();
                 }
@@ -862,6 +892,7 @@ async fn run_ssh_server(cfg: SshServeConfig) -> Result<()> {
                     cfg.vid,
                     cfg.pid,
                     &client.state.last_decode,
+                    client.state.display_db,
                     &client.state.frames,
                     true,
                 );
@@ -965,8 +996,6 @@ fn spawn_hid_worker(
             loop {
                 let db = synthetic_db(demo_start);
                 let _ = frame_tx.send(Frame {
-                    ts: Local::now(),
-                    bytes: Vec::new(),
                     decoded: Some(format!("demo current={db:.1} dB")),
                     db: Some(db),
                 });
@@ -978,8 +1007,6 @@ fn spawn_hid_worker(
             Ok(api) => api,
             Err(e) => {
                 let _ = frame_tx.send(Frame {
-                    ts: Local::now(),
-                    bytes: Vec::new(),
                     decoded: Some(format!("HID init error: {e}")),
                     db: None,
                 });
@@ -990,8 +1017,6 @@ fn spawn_hid_worker(
             Ok(dev) => dev,
             Err(e) => {
                 let _ = frame_tx.send(Frame {
-                    ts: Local::now(),
-                    bytes: Vec::new(),
                     decoded: Some(format!(
                         "Device open error VID=0x{vid:04X} PID=0x{pid:04X}: {e}"
                     )),
@@ -1012,14 +1037,10 @@ fn spawn_hid_worker(
             {
                 let event = match dev.write(frame) {
                     Ok(_) => Frame {
-                        ts: Local::now(),
-                        bytes: frame.clone(),
                         decoded: Some("TX probe".to_string()),
                         db: None,
                     },
                     Err(e) => Frame {
-                        ts: Local::now(),
-                        bytes: frame.clone(),
                         decoded: Some(format!("TX error: {e}")),
                         db: None,
                     },
@@ -1033,18 +1054,11 @@ fn spawn_hid_worker(
                     let bytes = buf[..n].to_vec();
                     let decoded = decode_frame(&bytes);
                     let db = extract_db(&bytes);
-                    let _ = frame_tx.send(Frame {
-                        ts: Local::now(),
-                        bytes,
-                        decoded,
-                        db,
-                    });
+                    let _ = frame_tx.send(Frame { decoded, db });
                 }
                 Ok(_) => {}
                 Err(e) => {
                     let _ = frame_tx.send(Frame {
-                        ts: Local::now(),
-                        bytes: Vec::new(),
                         decoded: Some(format!("Read error: {e}")),
                         db: None,
                     });
@@ -1060,135 +1074,93 @@ fn draw_ui<B: ratatui::backend::Backend>(
     vid: u16,
     pid: u16,
     last_decode: &str,
+    display_db: Option<f32>,
     frames: &VecDeque<Frame>,
     ssh_mode: bool,
 ) -> Result<()> {
     terminal
         .draw(|f| {
-            let bar_count = f.area().width.saturating_sub(2).max(11) as usize;
-            let (bars, current_db) = build_history_bars(frames, bar_count);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Length(3),
-                    Constraint::Length(10),
-                    Constraint::Min(1),
-                ])
-                .split(f.area());
+            let mode_note = if ssh_mode { "ssh" } else { "local" };
+            let title = format!(
+                "Volume History  VID=0x{vid:04X} PID=0x{pid:04X}  mode={mode_note}  q/Ctrl+C=quit"
+            );
+            let block = Block::default().borders(Borders::ALL).title(title);
+            let area = f.area();
+            let inner = block.inner(area);
+            f.render_widget(block, area);
 
-            let mode_note = if ssh_mode {
-                "  mode=ssh  q=close session"
-            } else {
-                "  mode=local  q=quit"
-            };
+            if inner.width < 3 || inner.height < 3 {
+                return;
+            }
 
-            let header = Paragraph::new(Line::from(vec![
-                Span::styled("USB Sound Meter", Style::default().fg(Color::Cyan)),
-                Span::raw(format!("  VID=0x{vid:04X} PID=0x{pid:04X}")),
-                Span::raw(mode_note),
-            ]))
-            .block(Block::default().borders(Borders::ALL).title("Session"));
+            let (cols, current_db, center_col) = history_columns(frames, inner.width as usize);
+            let lines = build_graph_lines(&cols, inner.height as usize, center_col);
+            f.render_widget(Paragraph::new(lines), inner);
 
-            let decode = Paragraph::new(last_decode.to_string()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Last Decoded Measurement"),
+            let shown_db = display_db.or(current_db);
+            let current_text = shown_db
+                .map(|db| format!("{db:.1}"))
+                .unwrap_or_else(|| "n/a".to_string());
+            let scale = compute_big_scale(inner.width, inner.height, &current_text);
+            let (big_w, big_h) = big_text_size(&current_text, scale);
+            let tx = inner
+                .x
+                .saturating_add(inner.width / 2)
+                .saturating_sub(big_w / 2);
+            let ty = inner
+                .y
+                .saturating_add(inner.height / 2)
+                .saturating_sub(big_h / 2);
+            render_big_text(
+                f,
+                tx,
+                ty,
+                &current_text,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+                scale,
             );
 
-            let chart_title = if let Some(db) = current_db {
-                format!("Volume History  current(center)={db:.1} dB")
-            } else {
-                "Volume History  current(center)=n/a".to_string()
-            };
-            let chart = BarChart::default()
-                .block(Block::default().borders(Borders::ALL).title(chart_title))
-                .data(BarGroup::default().bars(&bars))
-                .max(CHART_DB_MAX)
-                .bar_width(1)
-                .bar_gap(0)
-                .value_style(Style::default().fg(Color::Gray));
-
-            let mut lines: Vec<Line> = Vec::new();
-            for frame in frames.iter().take(35) {
-                let ts = frame.ts.format("%H:%M:%S%.3f").to_string();
-                let mut line = format!("{ts}  {}", fmt_hex(&frame.bytes));
-                if let Some(decoded) = &frame.decoded {
-                    line.push_str("  |  ");
-                    line.push_str(decoded);
-                }
-                lines.push(Line::from(line));
+            let unit = "dB";
+            let ux = inner
+                .x
+                .saturating_add(inner.width / 2)
+                .saturating_sub((unit.len() as u16) / 2);
+            let uy = ty.saturating_add(big_h).saturating_add(1);
+            if uy < inner.y.saturating_add(inner.height) {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        unit.to_string(),
+                        Style::default().fg(Color::Gray),
+                    ))),
+                    Rect {
+                        x: ux,
+                        y: uy,
+                        width: unit.len() as u16,
+                        height: 1,
+                    },
+                );
             }
-            if lines.is_empty() {
-                lines.push(Line::from("No frames yet."));
-            }
-            let traffic = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("Traffic"));
 
-            f.render_widget(header, chunks[0]);
-            f.render_widget(decode, chunks[1]);
-            f.render_widget(chart, chunks[2]);
-            f.render_widget(traffic, chunks[3]);
+            if !last_decode.is_empty() && inner.height > 2 {
+                let status_rect = Rect {
+                    x: inner.x.saturating_add(1),
+                    y: inner.y.saturating_add(inner.height.saturating_sub(1)),
+                    width: inner.width.saturating_sub(2),
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        last_decode.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    status_rect,
+                );
+            }
         })
         .map_err(|e| anyhow::anyhow!("terminal draw failed: {e:?}"))?;
     Ok(())
-}
-
-fn build_history_bars(frames: &VecDeque<Frame>, width: usize) -> (Vec<Bar<'static>>, Option<f32>) {
-    let width = width.max(11);
-    let center = width / 2;
-    let mut slots: Vec<Option<f32>> = vec![None; width];
-    let history: Vec<f32> = frames.iter().filter_map(|f| f.db).collect();
-    let current = history.first().copied();
-    if let Some(db) = current {
-        slots[center] = Some(db);
-    }
-
-    for i in 1..=center {
-        if let Some(db) = history.get(i) {
-            slots[center - i] = Some(*db);
-        } else {
-            break;
-        }
-    }
-
-    let mut bars = Vec::with_capacity(width);
-    for (idx, slot) in slots.iter().enumerate() {
-        let (value, style) = if let Some(db) = slot {
-            (
-                (*db).clamp(0.0, CHART_DB_MAX as f32) as u64,
-                color_for_db(*db),
-            )
-        } else {
-            (0, Style::default().fg(Color::DarkGray))
-        };
-        let marker = if idx == center { "|" } else { " " };
-        let bar = if idx == center {
-            let center_text = slot
-                .map(|d| format!("{d:.1}"))
-                .unwrap_or_else(|| "n/a".to_string());
-            Bar::default()
-                .value(value)
-                .style(style)
-                .label(marker)
-                .text_value(center_text)
-        } else {
-            Bar::default().value(value).style(style).label(marker)
-        };
-        bars.push(bar);
-    }
-
-    (bars, current)
-}
-
-fn color_for_db(db: f32) -> Style {
-    if db < 55.0 {
-        Style::default().fg(Color::Green)
-    } else if db < 80.0 {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::Red)
-    }
 }
 
 fn synthetic_db(start: Instant) -> f32 {
@@ -1200,4 +1172,220 @@ fn synthetic_db(start: Instant) -> f32 {
         0.0
     };
     (wave + burst).clamp(32.0, 108.0)
+}
+
+fn history_columns(
+    frames: &VecDeque<Frame>,
+    width: usize,
+) -> (Vec<Option<f32>>, Option<f32>, usize) {
+    let width = width.max(11);
+    let center = width.saturating_sub(1);
+    let mut cols: Vec<Option<f32>> = vec![None; width];
+    let history: Vec<f32> = frames.iter().filter_map(|f| f.db).collect();
+    let current = history.first().copied();
+    cols[center] = current;
+
+    for i in 1..width {
+        if let Some(v) = history.get(i) {
+            cols[center - i] = Some(*v);
+        } else {
+            break;
+        }
+    }
+    (cols, current, center)
+}
+
+fn build_graph_lines(cols: &[Option<f32>], height: usize, center_col: usize) -> Vec<Line<'static>> {
+    let cols = smooth_columns(cols);
+    let heights: Vec<usize> = cols
+        .iter()
+        .map(|v| v.map(|db| db_to_rows(db, height)).unwrap_or(0))
+        .collect();
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    for y in 0..height {
+        let mut spans: Vec<Span> = Vec::with_capacity(cols.len());
+        for x in 0..cols.len() {
+            let mut ch = ' ';
+            let mut style = Style::default();
+            let h = heights[x];
+            if h > 0 {
+                let line_y = height.saturating_sub(h);
+                if y >= line_y {
+                    ch = '󰇝';
+                    style = style.fg(gradient_color_for_row(y, height));
+                }
+            }
+
+            if x == center_col && ch == ' ' {
+                ch = '┊';
+                style = style.fg(Color::DarkGray);
+            }
+
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn smooth_columns(cols: &[Option<f32>]) -> Vec<Option<f32>> {
+    let mut out = Vec::with_capacity(cols.len());
+    for i in 0..cols.len() {
+        if cols[i].is_none() {
+            out.push(None);
+            continue;
+        }
+        let mut acc = 0.0f32;
+        let mut wsum = 0.0f32;
+        for (off, w) in [
+            (-2isize, 0.10f32),
+            (-1, 0.22),
+            (0, 0.36),
+            (1, 0.22),
+            (2, 0.10),
+        ] {
+            let idx = i as isize + off;
+            if idx >= 0
+                && (idx as usize) < cols.len()
+                && let Some(v) = cols[idx as usize]
+            {
+                acc += v * w;
+                wsum += w;
+            }
+        }
+        if wsum > 0.0 {
+            out.push(Some(acc / wsum));
+        } else {
+            out.push(cols[i]);
+        }
+    }
+    out
+}
+
+fn db_to_rows(db: f32, height: usize) -> usize {
+    if height == 0 {
+        return 0;
+    }
+    let normalized = ((db - CHART_DB_MIN) / (CHART_DB_MAX - CHART_DB_MIN)).clamp(0.0, 1.0);
+    ((normalized * height as f32).round() as usize).clamp(0, height)
+}
+
+fn gradient_color_for_row(y: usize, height: usize) -> Color {
+    if height <= 1 {
+        return Color::Green;
+    }
+    let t = 1.0 - (y as f32 / (height - 1) as f32);
+    // Continuous heat-style gradient with two linear segments:
+    // green -> yellow -> red.
+    if t < 0.5 {
+        let u = t / 0.5;
+        let r = lerp_u8(46, 232, u);
+        let g = lerp_u8(204, 215, u);
+        let b = lerp_u8(113, 72, u);
+        Color::Rgb(r, g, b)
+    } else {
+        let u = (t - 0.5) / 0.5;
+        let r = lerp_u8(232, 255, u);
+        let g = lerp_u8(215, 76, u);
+        let b = lerp_u8(72, 60, u);
+        Color::Rgb(r, g, b)
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
+    let base_h = 5u16;
+    let mut base_w = 0u16;
+    for ch in text.chars() {
+        base_w = base_w.saturating_add(big_glyph(ch)[0].chars().count() as u16);
+        base_w = base_w.saturating_add(1);
+    }
+    base_w = base_w.saturating_sub(1);
+    if base_w == 0 {
+        return 1;
+    }
+    let w_budget = inner_w.saturating_sub(4);
+    let h_budget = inner_h.saturating_sub(4);
+    let by_w = (w_budget / base_w).max(1);
+    let by_h = (h_budget / (base_h + 1)).max(1);
+    by_w.min(by_h).clamp(1, 4)
+}
+
+fn big_text_size(text: &str, scale: u16) -> (u16, u16) {
+    let mut width = 0u16;
+    for ch in text.chars() {
+        let glyph = big_glyph(ch);
+        width = width.saturating_add((glyph[0].chars().count() as u16).saturating_mul(scale));
+        width = width.saturating_add(scale);
+    }
+    (
+        width.saturating_sub(scale),
+        5u16.saturating_mul(scale),
+    )
+}
+
+fn render_big_text(
+    f: &mut ratatui::Frame<'_>,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: Style,
+    scale: u16,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let mut rows = vec![String::new(), String::new(), String::new(), String::new(), String::new()];
+    for ch in text.chars() {
+        let glyph = big_glyph(ch);
+        for i in 0..5 {
+            for c in glyph[i].chars() {
+                for _ in 0..scale {
+                    rows[i].push(c);
+                }
+            }
+            for _ in 0..scale {
+                rows[i].push(' ');
+            }
+        }
+    }
+    for (i, row) in rows.iter().enumerate() {
+        for sy in 0..scale {
+            let out_y = y.saturating_add((i as u16).saturating_mul(scale)).saturating_add(sy);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(row.clone(), style))),
+                Rect {
+                    x,
+                    y: out_y,
+                    width: row.chars().count() as u16,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+fn big_glyph(ch: char) -> [&'static str; 5] {
+    match ch {
+        '0' => ["█████", "█   █", "█   █", "█   █", "█████"],
+        '1' => ["  ██ ", " ███ ", "  ██ ", "  ██ ", "█████"],
+        '2' => ["█████", "    █", "█████", "█    ", "█████"],
+        '3' => ["█████", "    █", " ████", "    █", "█████"],
+        '4' => ["█   █", "█   █", "█████", "    █", "    █"],
+        '5' => ["█████", "█    ", "█████", "    █", "█████"],
+        '6' => ["█████", "█    ", "█████", "█   █", "█████"],
+        '7' => ["█████", "    █", "   █ ", "  █  ", " █   "],
+        '8' => ["█████", "█   █", "█████", "█   █", "█████"],
+        '9' => ["█████", "█   █", "█████", "    █", "█████"],
+        '.' => ["     ", "     ", "     ", "     ", "  ██ "],
+        '-' => ["     ", "     ", "█████", "     ", "     "],
+        'n' | 'N' => ["     ", "███  ", "█  █ ", "█  ██", "█   █"],
+        'a' | 'A' => ["     ", " ███ ", "█   █", "█████", "█   █"],
+        '/' => ["    █", "   █ ", "  █  ", " █   ", "█    "],
+        _ => ["     ", "  ?  ", "  ?  ", "  ?  ", "     "],
+    }
 }
