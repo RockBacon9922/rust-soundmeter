@@ -46,6 +46,12 @@ cargo run -- sniff --vid 0x64BD --pid 0x74E3 --tx "00 01 02 03" --tx-interval-ms
 cargo run -- set --vid 0x64BD --pid 0x74E3 --set-mode FAST --set-max MAX --set-weighting C --set-range 2
 ```
 
+5. Open the live TUI (centered large reading with scrolling history graph):
+
+```bash
+cargo run -- tui --vid 0x64BD --pid 0x74E3 --tx-interval-ms 120
+```
+
 Notes:
 - `sniff` uses vendor `ReadPoint` polling by default (`--wake true`).
 - Writable startup settings map to vendor `WriteSettings`: `--set-mode FAST|SLOW`, `--set-max MAX|NORMAL`, `--set-weighting A|C`, `--set-range 0..4`.

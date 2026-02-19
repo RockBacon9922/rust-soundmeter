@@ -1,10 +1,24 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use clap::{ArgAction, Parser, Subcommand};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use hidapi::{DeviceInfo, HidApi, HidDevice};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::prelude::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 const DEFAULT_VID: u16 = 0x64BD;
 const DEFAULT_PID: u16 = 0x74E3;
@@ -12,11 +26,13 @@ const REPORT_ID: u8 = 0x00;
 const FRAME_FILL: u8 = 0x23;
 const FRAME_LEN: usize = 65;
 const HID_READ_TIMEOUT_MS: i32 = 200;
+const TUI_READ_TIMEOUT_MS: i32 = 5;
 const MAX_FRAME_BYTES: usize = FRAME_LEN;
 const FLAG_BATTERY: u8 = 0x80;
 const FLAG_MODE_FAST: u8 = 0x40;
 const FLAG_MAX: u8 = 0x20;
 const FLAG_WEIGHT_C: u8 = 0x10;
+const TUI_FRAME_MS: u64 = 33;
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-soundmeter")]
@@ -70,6 +86,28 @@ enum Command {
         wake: bool,
         /// Interval in ms for optional TX polling frame.
         #[arg(long, default_value_t = 1000)]
+        tx_interval_ms: u64,
+        /// Apply device mode on startup: FAST or SLOW.
+        #[arg(long)]
+        set_mode: Option<String>,
+        /// Apply MAX state on startup: MAX or NORMAL.
+        #[arg(long)]
+        set_max: Option<String>,
+        /// Apply weighting on startup: A or C.
+        #[arg(long)]
+        set_weighting: Option<String>,
+        /// Apply range on startup (vendor docs indicate 0..4).
+        #[arg(long)]
+        set_range: Option<u8>,
+    },
+    /// Show a live terminal UI with current reading and scrolling history.
+    Tui {
+        #[arg(long, default_value = "0x64BD")]
+        vid: String,
+        #[arg(long, default_value = "0x74E3")]
+        pid: String,
+        /// Poll interval in ms for ReadPoint requests.
+        #[arg(long, default_value_t = 120)]
         tx_interval_ms: u64,
         /// Apply device mode on startup: FAST or SLOW.
         #[arg(long)]
@@ -332,6 +370,20 @@ fn main() -> Result<()> {
             tx_interval_ms,
             parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
         ),
+        Some(Command::Tui {
+            vid,
+            pid,
+            tx_interval_ms,
+            set_mode,
+            set_max,
+            set_weighting,
+            set_range,
+        }) => cmd_tui(
+            vid,
+            pid,
+            tx_interval_ms,
+            parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
+        ),
         None => cmd_sniff(
             format!("0x{DEFAULT_VID:04X}"),
             format!("0x{DEFAULT_PID:04X}"),
@@ -467,6 +519,417 @@ fn cmd_sniff(
             Ok(_) => {}
             Err(e) => eprintln!("read error: {e}"),
         }
+    }
+}
+
+fn cmd_tui(
+    vid: String,
+    pid: String,
+    tx_interval_ms: u64,
+    startup_settings: Option<ProtocolMember>,
+) -> Result<()> {
+    let (vid, pid) = lock_target_ids(&vid, &pid)?;
+    let api = HidApi::new().context("failed to initialize hidapi")?;
+    let dev = open_hid_device(&api, vid, pid)?;
+
+    if let Some(settings) = startup_settings.as_ref() {
+        apply_startup_settings(&dev, settings)?;
+    }
+
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
+    terminal.clear().context("failed to clear terminal")?;
+
+    let app_result = run_tui(&mut terminal, &dev, vid, pid, tx_interval_ms);
+
+    disable_raw_mode().context("failed to disable raw mode")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .context("failed to leave alternate screen")?;
+    terminal.show_cursor().context("failed to show cursor")?;
+
+    app_result
+}
+
+fn run_tui(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    dev: &HidDevice,
+    vid: u16,
+    pid: u16,
+    tx_interval_ms: u64,
+) -> Result<()> {
+    let sample_interval = Duration::from_millis(tx_interval_ms.max(40));
+    let frame_interval = Duration::from_millis(TUI_FRAME_MS);
+    let mut last_tx = Instant::now()
+        .checked_sub(sample_interval)
+        .unwrap_or_else(Instant::now);
+    let mut history = VecDeque::new();
+    let mut current = None;
+    let mut status = String::from("polling");
+    let mut buf = [0u8; MAX_FRAME_BYTES];
+
+    loop {
+        while event::poll(Duration::from_millis(0)).context("failed to poll terminal event")? {
+            match event::read().context("failed to read terminal event")? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && matches!(
+                            key.code,
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c')
+                        )
+                        && (key.code != KeyCode::Char('c')
+                            || key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL)) =>
+                {
+                    return Ok(());
+                }
+                Event::Resize(_, _) => {
+                    terminal
+                        .clear()
+                        .context("failed to clear terminal after resize")?;
+                }
+                _ => {}
+            }
+        }
+
+        if last_tx.elapsed() >= sample_interval {
+            if let Err(e) = write_frame(dev, &protocol_read_point()) {
+                status = format!("poll write error: {e}");
+            } else {
+                status = String::from("polling");
+            }
+            last_tx = Instant::now();
+        }
+
+        match dev.read_timeout(&mut buf, TUI_READ_TIMEOUT_MS) {
+            Ok(n) if n > 0 => {
+                if let Some(measurement) = protocol_analysis_read_point(&buf[..n])
+                    && (-50.0..=150.0).contains(&measurement.mea_value)
+                {
+                    current = Some(measurement.mea_value);
+                    history.push_back(measurement.mea_value);
+                    while history.len() > 20_000 {
+                        history.pop_front();
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+
+        terminal
+            .draw(|frame| draw_tui(frame, vid, pid, current, &history, sample_interval, &status))
+            .context("failed drawing terminal frame")?;
+
+        thread::sleep(frame_interval);
+    }
+}
+
+fn draw_tui(
+    frame: &mut ratatui::Frame<'_>,
+    vid: u16,
+    pid: u16,
+    current: Option<f32>,
+    history: &VecDeque<f32>,
+    sample_interval: Duration,
+    status: &str,
+) {
+    let history_seconds =
+        (sample_interval.as_secs_f32() * frame.area().width as f32).round() as u32;
+    let title = format!(
+        "Volume History  VID=0x{vid:04X} PID=0x{pid:04X}  window=~{history_seconds}s  q/Ctrl+C=quit"
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let area = frame.area();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 3 || inner.height < 3 {
+        return;
+    }
+
+    let (cols, latest_db, center_col) = history_columns(history, inner.width as usize);
+    let lines = build_graph_lines(&cols, inner.height as usize, center_col);
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let shown_db = current.or(latest_db);
+    let current_text = shown_db
+        .map(|db| format!("{db:.1}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let scale = compute_big_scale(inner.width, inner.height, &current_text);
+    let (big_w, big_h) = big_text_size(&current_text, scale);
+    let tx = inner
+        .x
+        .saturating_add(inner.width / 2)
+        .saturating_sub(big_w / 2);
+    let ty = inner
+        .y
+        .saturating_add(inner.height / 2)
+        .saturating_sub(big_h / 2);
+    render_big_text(
+        frame,
+        tx,
+        ty,
+        &current_text,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        scale,
+    );
+
+    let unit = "dB";
+    let ux = inner
+        .x
+        .saturating_add(inner.width / 2)
+        .saturating_sub((unit.len() as u16) / 2);
+    let uy = ty.saturating_add(big_h).saturating_add(1);
+    if uy < inner.bottom() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                unit,
+                Style::default().fg(Color::Gray),
+            ))),
+            Rect {
+                x: ux,
+                y: uy,
+                width: unit.len() as u16,
+                height: 1,
+            },
+        );
+    }
+
+    if inner.height > 2 {
+        let status_rect = Rect {
+            x: inner.x.saturating_add(1),
+            y: inner.bottom().saturating_sub(1),
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                status.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            status_rect,
+        );
+    }
+}
+
+fn history_columns(
+    history: &VecDeque<f32>,
+    width: usize,
+) -> (Vec<Option<f32>>, Option<f32>, usize) {
+    let width = width.max(11);
+    let center = width.saturating_sub(1);
+    let mut cols: Vec<Option<f32>> = vec![None; width];
+    let current = history.back().copied();
+    cols[center] = current;
+
+    for i in 1..width {
+        let idx = history.len().checked_sub(1 + i);
+        if let Some(v) = idx.and_then(|j| history.get(j)) {
+            cols[center - i] = Some(*v);
+        } else {
+            break;
+        }
+    }
+    (cols, current, center)
+}
+
+fn build_graph_lines(cols: &[Option<f32>], height: usize, center_col: usize) -> Vec<Line<'static>> {
+    let cols = smooth_columns(cols);
+    let heights: Vec<usize> = cols
+        .iter()
+        .map(|v| v.map(|db| db_to_rows(db, height)).unwrap_or(0))
+        .collect();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    for y in 0..height {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols.len());
+        for x in 0..cols.len() {
+            let mut ch = ' ';
+            let mut style = Style::default();
+            let h = heights[x];
+            if h > 0 {
+                let line_y = height.saturating_sub(h);
+                if y >= line_y {
+                    ch = '#';
+                    style = style.fg(gradient_color_for_row(y, height));
+                }
+            }
+
+            if x == center_col && ch == ' ' {
+                ch = '|';
+                style = style.fg(Color::DarkGray);
+            }
+
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn smooth_columns(cols: &[Option<f32>]) -> Vec<Option<f32>> {
+    let mut out = Vec::with_capacity(cols.len());
+    for i in 0..cols.len() {
+        if cols[i].is_none() {
+            out.push(None);
+            continue;
+        }
+        let mut acc = 0.0f32;
+        let mut wsum = 0.0f32;
+        for (off, w) in [
+            (-2isize, 0.10f32),
+            (-1, 0.22),
+            (0, 0.36),
+            (1, 0.22),
+            (2, 0.10),
+        ] {
+            let idx = i as isize + off;
+            if idx >= 0
+                && (idx as usize) < cols.len()
+                && let Some(v) = cols[idx as usize]
+            {
+                acc += v * w;
+                wsum += w;
+            }
+        }
+        if wsum > 0.0 {
+            out.push(Some(acc / wsum));
+        } else {
+            out.push(cols[i]);
+        }
+    }
+    out
+}
+
+fn db_to_rows(db: f32, height: usize) -> usize {
+    const CHART_DB_MIN: f32 = 20.0;
+    const CHART_DB_MAX: f32 = 120.0;
+    if height == 0 {
+        return 0;
+    }
+    let normalized = ((db - CHART_DB_MIN) / (CHART_DB_MAX - CHART_DB_MIN)).clamp(0.0, 1.0);
+    ((normalized * height as f32).round() as usize).clamp(0, height)
+}
+
+fn gradient_color_for_row(y: usize, height: usize) -> Color {
+    if height <= 1 {
+        return Color::Green;
+    }
+    let t = 1.0 - (y as f32 / (height - 1) as f32);
+    if t < 0.5 {
+        let u = t / 0.5;
+        let r = lerp_u8(46, 232, u);
+        let g = lerp_u8(204, 215, u);
+        let b = lerp_u8(113, 72, u);
+        Color::Rgb(r, g, b)
+    } else {
+        let u = (t - 0.5) / 0.5;
+        let r = lerp_u8(232, 255, u);
+        let g = lerp_u8(215, 76, u);
+        let b = lerp_u8(72, 60, u);
+        Color::Rgb(r, g, b)
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
+    let base_h = 5u16;
+    let mut base_w = 0u16;
+    for ch in text.chars() {
+        base_w = base_w.saturating_add(big_glyph(ch)[0].chars().count() as u16);
+        base_w = base_w.saturating_add(1);
+    }
+    base_w = base_w.saturating_sub(1);
+    if base_w == 0 {
+        return 1;
+    }
+    let w_budget = inner_w.saturating_sub(4);
+    let h_budget = inner_h.saturating_sub(4);
+    let by_w = (w_budget / base_w).max(1);
+    let by_h = (h_budget / (base_h + 1)).max(1);
+    by_w.min(by_h).clamp(1, 4)
+}
+
+fn big_text_size(text: &str, scale: u16) -> (u16, u16) {
+    let mut width = 0u16;
+    for ch in text.chars() {
+        let glyph = big_glyph(ch);
+        width = width.saturating_add((glyph[0].chars().count() as u16).saturating_mul(scale));
+        width = width.saturating_add(scale);
+    }
+    (width.saturating_sub(scale), 5u16.saturating_mul(scale))
+}
+
+fn render_big_text(
+    frame: &mut ratatui::Frame<'_>,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: Style,
+    scale: u16,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let area = frame.area();
+    let buf: &mut Buffer = frame.buffer_mut();
+    let mut cursor_x = x;
+
+    for ch in text.chars() {
+        let glyph = big_glyph(ch);
+        for (row_idx, row) in glyph.iter().enumerate() {
+            for sy in 0..scale {
+                let yy = y
+                    .saturating_add((row_idx as u16).saturating_mul(scale))
+                    .saturating_add(sy);
+                if yy >= area.bottom() {
+                    continue;
+                }
+                let mut local_x = cursor_x;
+                for c in row.chars() {
+                    for _ in 0..scale {
+                        if local_x >= area.right() {
+                            break;
+                        }
+                        if c != ' ' {
+                            buf[(local_x, yy)].set_char(c).set_style(style);
+                        }
+                        local_x = local_x.saturating_add(1);
+                    }
+                }
+            }
+        }
+        cursor_x = cursor_x.saturating_add((big_glyph(ch)[0].chars().count() as u16 + 1) * scale);
+    }
+}
+
+fn big_glyph(ch: char) -> [&'static str; 5] {
+    match ch {
+        '0' => ["#####", "#   #", "#   #", "#   #", "#####"],
+        '1' => ["  ## ", " ### ", "  ## ", "  ## ", "#####"],
+        '2' => ["#####", "    #", "#####", "#    ", "#####"],
+        '3' => ["#####", "    #", " ####", "    #", "#####"],
+        '4' => ["#   #", "#   #", "#####", "    #", "    #"],
+        '5' => ["#####", "#    ", "#####", "    #", "#####"],
+        '6' => ["#####", "#    ", "#####", "#   #", "#####"],
+        '7' => ["#####", "    #", "   # ", "  #  ", " #   "],
+        '8' => ["#####", "#   #", "#####", "#   #", "#####"],
+        '9' => ["#####", "#   #", "#####", "    #", "#####"],
+        '.' => ["     ", "     ", "     ", "     ", "  ## "],
+        '-' => ["     ", "     ", "#####", "     ", "     "],
+        'n' | 'N' => ["     ", "###  ", "#  # ", "#  ##", "#   #"],
+        'a' | 'A' => ["     ", " ### ", "#   #", "#####", "#   #"],
+        '/' => ["    #", "   # ", "  #  ", " #   ", "#    "],
+        _ => ["     ", "  ?  ", "  ?  ", "  ?  ", "     "],
     }
 }
 
