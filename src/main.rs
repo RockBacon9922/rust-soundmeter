@@ -13,6 +13,10 @@ const FRAME_FILL: u8 = 0x23;
 const FRAME_LEN: usize = 65;
 const HID_READ_TIMEOUT_MS: i32 = 200;
 const MAX_FRAME_BYTES: usize = FRAME_LEN;
+const FLAG_BATTERY: u8 = 0x80;
+const FLAG_MODE_FAST: u8 = 0x40;
+const FLAG_MAX: u8 = 0x20;
+const FLAG_WEIGHT_C: u8 = 0x10;
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-soundmeter")]
@@ -87,7 +91,7 @@ struct ProtocolMember {
     mea_value: f32,
     bat: u8,
     mode: &'static str,
-    max: &'static str,
+    is_max: bool,
     weighting: &'static str,
     range: u8,
     time: Option<String>,
@@ -114,25 +118,23 @@ fn protocol_read_point() -> Vec<u8> {
     protocol_command(0xB3)
 }
 
-#[allow(dead_code)]
 fn protocol_write_settings(set: &ProtocolMember) -> Vec<u8> {
     let mut out = protocol_command(0x56);
     let mut flags = 0u8;
     if set.mode == "FAST" {
-        flags |= 0x40;
+        flags |= FLAG_MODE_FAST;
     }
-    if set.max == "MAX" {
-        flags |= 0x20;
+    if set.is_max {
+        flags |= FLAG_MAX;
     }
     if set.weighting == "C" {
-        flags |= 0x10;
+        flags |= FLAG_WEIGHT_C;
     }
     flags |= set.range & 0x0F;
     out[2] = flags;
     out
 }
 
-#[allow(dead_code)]
 fn protocol_is_correct(buffer: &[u8]) -> bool {
     protocol_report_byte(buffer, 0) == Some(0xC4) || protocol_report_byte(buffer, 1) == Some(0xC4)
 }
@@ -153,9 +155,9 @@ fn parse_startup_settings(
         Some(v) => bail!("invalid --set-mode '{v}', expected FAST or SLOW"),
     };
     let max = match max.as_deref() {
-        None => "",
-        Some(v) if v.eq_ignore_ascii_case("MAX") => "MAX",
-        Some(v) if v.eq_ignore_ascii_case("NORMAL") => "",
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("MAX") => true,
+        Some(v) if v.eq_ignore_ascii_case("NORMAL") => false,
         Some(v) => bail!("invalid --set-max '{v}', expected MAX or NORMAL"),
     };
     let weighting = match weighting.as_deref() {
@@ -172,7 +174,7 @@ fn parse_startup_settings(
         mea_value: 0.0,
         bat: 0,
         mode,
-        max,
+        is_max: max,
         weighting,
         range,
         time: None,
@@ -180,15 +182,15 @@ fn parse_startup_settings(
     }))
 }
 
-fn max_label(max: &str) -> &'static str {
-    if max == "MAX" { "MAX" } else { "NORMAL" }
+fn max_label(is_max: bool) -> &'static str {
+    if is_max { "MAX" } else { "NORMAL" }
 }
 
 fn device_settings_summary(settings: &ProtocolMember) -> String {
     format!(
         "mode={} max={} weight={} range={}",
         settings.mode,
-        max_label(settings.max),
+        max_label(settings.is_max),
         settings.weighting,
         settings.range
     )
@@ -219,14 +221,18 @@ fn protocol_analysis_read_point(buffer: &[u8]) -> Option<ProtocolMember> {
         let flags = protocol_report_byte(buffer, offset + 2)?;
         let signed = ((high << 8) | low) as i16;
         let mea_value = signed as f32 / 10.0;
-        let mode = if flags & 0x40 == 0 { "SLOW" } else { "FAST" };
-        let max = if flags & 0x20 == 0 { "" } else { "MAX" };
-        let weighting = if flags & 0x10 == 0 { "A" } else { "C" };
+        let mode = if flags & FLAG_MODE_FAST == 0 {
+            "SLOW"
+        } else {
+            "FAST"
+        };
+        let is_max = flags & FLAG_MAX != 0;
+        let weighting = if flags & FLAG_WEIGHT_C == 0 { "A" } else { "C" };
         Some(ProtocolMember {
             mea_value,
-            bat: (flags & 0x80) >> 7,
+            bat: (flags & FLAG_BATTERY) >> 7,
             mode,
-            max,
+            is_max,
             weighting,
             range: flags & 0x0F,
             time: None,
@@ -273,14 +279,18 @@ fn protocol_analysis_read_history_header(buffer: &[u8]) -> Option<ProtocolMember
     let yy = 2000u16 + bcd_to_u8(protocol_report_byte(buffer, 7)?) as u16;
     let mon = bcd_to_u8(protocol_report_byte(buffer, 6)?);
     let day = bcd_to_u8(protocol_report_byte(buffer, 5)?);
-    let mode = if flags & 0x40 == 0 { "SLOW" } else { "FAST" };
-    let max = if flags & 0x20 == 0 { "" } else { "MAX" };
-    let weighting = if flags & 0x10 == 0 { "A" } else { "C" };
+    let mode = if flags & FLAG_MODE_FAST == 0 {
+        "SLOW"
+    } else {
+        "FAST"
+    };
+    let is_max = flags & FLAG_MAX != 0;
+    let weighting = if flags & FLAG_WEIGHT_C == 0 { "A" } else { "C" };
     Some(ProtocolMember {
         mea_value: 0.0,
-        bat: (flags & 0x80) >> 7,
+        bat: (flags & FLAG_BATTERY) >> 7,
         mode,
-        max,
+        is_max,
         weighting,
         range: flags & 0x0F,
         time: Some(format!("{hh}:{mm}:{ss}")),
@@ -521,7 +531,7 @@ fn decode_frame(bytes: &[u8]) -> Option<String> {
             header.date.unwrap_or_else(|| "?".to_string()),
             header.time.unwrap_or_else(|| "?".to_string()),
             header.mode,
-            header.max,
+            max_label(header.is_max),
             header.weighting,
             header.range,
             header.bat
@@ -533,7 +543,12 @@ fn decode_frame(bytes: &[u8]) -> Option<String> {
     {
         return Some(format!(
             "current={:.1} dB mode={} {} weight={} range={} bat={}",
-            m.mea_value, m.mode, m.max, m.weighting, m.range, m.bat
+            m.mea_value,
+            m.mode,
+            max_label(m.is_max),
+            m.weighting,
+            m.range,
+            m.bat
         ));
     }
 
