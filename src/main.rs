@@ -18,7 +18,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 const DEFAULT_VID: u16 = 0x64BD;
 const DEFAULT_PID: u16 = 0x74E3;
@@ -33,6 +33,7 @@ const FLAG_MODE_FAST: u8 = 0x40;
 const FLAG_MAX: u8 = 0x20;
 const FLAG_WEIGHT_C: u8 = 0x10;
 const TUI_FRAME_MS: u64 = 33;
+const SETTINGS_ITEM_COUNT: usize = 4;
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-soundmeter")]
@@ -149,6 +150,13 @@ struct ProtocolMember {
     date: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SettingsMenuState {
+    open: bool,
+    selected: usize,
+    settings: ProtocolMember,
+}
+
 fn protocol_report_byte(buffer: &[u8], idx: usize) -> Option<u8> {
     let payload = if buffer.len() >= FRAME_LEN && !buffer.is_empty() && buffer[0] == REPORT_ID {
         &buffer[1..]
@@ -238,6 +246,55 @@ fn parse_startup_settings(
         time: None,
         date: None,
     }))
+}
+
+fn default_tui_settings() -> ProtocolMember {
+    ProtocolMember {
+        mea_value: 0.0,
+        bat: 0,
+        mode: "SLOW",
+        is_max: false,
+        weighting: "A",
+        range: 0,
+        time: None,
+        date: None,
+    }
+}
+
+fn move_menu_selection(selected: usize, delta: isize) -> usize {
+    let count = SETTINGS_ITEM_COUNT as isize;
+    (((selected as isize + delta).rem_euclid(count)) as usize).min(SETTINGS_ITEM_COUNT - 1)
+}
+
+fn adjust_menu_setting(settings: &mut ProtocolMember, selected: usize, delta: isize) -> bool {
+    match selected {
+        0 => {
+            settings.weighting = if settings.weighting == "A" { "C" } else { "A" };
+            true
+        }
+        1 => {
+            settings.mode = if settings.mode == "FAST" {
+                "SLOW"
+            } else {
+                "FAST"
+            };
+            true
+        }
+        2 => {
+            settings.is_max = !settings.is_max;
+            true
+        }
+        3 => {
+            let next = (settings.range as isize + delta).clamp(0, 4) as u8;
+            if next != settings.range {
+                settings.range = next;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 fn max_label(is_max: bool) -> &'static str {
@@ -561,6 +618,7 @@ fn cmd_tui(
     if let Some(settings) = startup_settings.as_ref() {
         apply_startup_settings(&dev, settings)?;
     }
+    let initial_settings = startup_settings.unwrap_or_else(default_tui_settings);
 
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -578,6 +636,7 @@ fn cmd_tui(
         tx_interval_ms,
         compact_poll,
         nerd_font,
+        initial_settings,
     );
 
     disable_raw_mode().context("failed to disable raw mode")?;
@@ -596,6 +655,7 @@ fn run_tui(
     tx_interval_ms: u64,
     compact_poll: bool,
     nerd_font: bool,
+    initial_settings: ProtocolMember,
 ) -> Result<()> {
     let sample_interval = Duration::from_millis(tx_interval_ms.max(20));
     let frame_interval = Duration::from_millis(TUI_FRAME_MS);
@@ -609,6 +669,12 @@ fn run_tui(
     let compact_frame = protocol_read_point_compact();
     let standard_frame = protocol_read_point();
     let mut use_compact = compact_poll;
+    let mut menu = SettingsMenuState {
+        open: false,
+        selected: 0,
+        settings: initial_settings,
+    };
+    let mut initialized_from_device = false;
 
     loop {
         while event::poll(Duration::from_millis(0)).context("failed to poll terminal event")? {
@@ -624,8 +690,53 @@ fn run_tui(
                                 .modifiers
                                 .contains(crossterm::event::KeyModifiers::CONTROL)) =>
                 {
+                    if menu.open && key.code == KeyCode::Esc {
+                        menu.open = false;
+                        continue;
+                    }
                     return Ok(());
                 }
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('m') => {
+                        menu.open = !menu.open;
+                        status = if menu.open {
+                            String::from("settings menu open")
+                        } else {
+                            String::from("settings menu closed")
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if menu.open => {
+                        menu.selected = move_menu_selection(menu.selected, -1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if menu.open => {
+                        menu.selected = move_menu_selection(menu.selected, 1);
+                    }
+                    KeyCode::Left | KeyCode::Char('h') if menu.open => {
+                        if adjust_menu_setting(&mut menu.settings, menu.selected, -1) {
+                            match apply_startup_settings(dev, &menu.settings) {
+                                Ok(true) => {
+                                    status =
+                                        format!("saved {}", device_settings_summary(&menu.settings))
+                                }
+                                Ok(false) => status = String::from("save sent (no-ack)"),
+                                Err(e) => status = format!("save failed: {e}"),
+                            }
+                        }
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if menu.open => {
+                        if adjust_menu_setting(&mut menu.settings, menu.selected, 1) {
+                            match apply_startup_settings(dev, &menu.settings) {
+                                Ok(true) => {
+                                    status =
+                                        format!("saved {}", device_settings_summary(&menu.settings))
+                                }
+                                Ok(false) => status = String::from("save sent (no-ack)"),
+                                Err(e) => status = format!("save failed: {e}"),
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Event::Resize(_, _) => {
                     terminal
                         .clear()
@@ -661,6 +772,13 @@ fn run_tui(
                 if let Some(measurement) = protocol_analysis_read_point(&buf[..n])
                     && (-50.0..=150.0).contains(&measurement.mea_value)
                 {
+                    if !initialized_from_device {
+                        menu.settings.mode = measurement.mode;
+                        menu.settings.is_max = measurement.is_max;
+                        menu.settings.weighting = measurement.weighting;
+                        menu.settings.range = measurement.range.min(4);
+                        initialized_from_device = true;
+                    }
                     current = Some(measurement.mea_value);
                     history.push_back(measurement.mea_value);
                     while history.len() > 20_000 {
@@ -683,6 +801,7 @@ fn run_tui(
                     sample_interval,
                     &status,
                     nerd_font,
+                    &menu,
                 )
             })
             .context("failed drawing terminal frame")?;
@@ -740,11 +859,12 @@ fn draw_tui(
     sample_interval: Duration,
     status: &str,
     nerd_font: bool,
+    menu: &SettingsMenuState,
 ) {
     let history_seconds =
         (sample_interval.as_secs_f32() * frame.area().width as f32).round() as u32;
     let title = format!(
-        "Volume History  VID=0x{vid:04X} PID=0x{pid:04X}  window=~{history_seconds}s  q/Ctrl+C=quit"
+        "Volume History  VID=0x{vid:04X} PID=0x{pid:04X}  window=~{history_seconds}s  m=settings  q/Ctrl+C=quit"
     );
     let block = Block::default().borders(Borders::ALL).title(title);
     let area = frame.area();
@@ -821,6 +941,73 @@ fn draw_tui(
             status_rect,
         );
     }
+
+    if menu.open {
+        draw_settings_popup(frame, area, menu);
+    }
+}
+
+fn draw_settings_popup(frame: &mut ratatui::Frame<'_>, area: Rect, menu: &SettingsMenuState) {
+    let popup_width = if area.width >= 20 {
+        area.width.min(44)
+    } else {
+        area.width
+    };
+    let popup_height = if area.height >= 7 {
+        area.height.min(11)
+    } else {
+        area.height
+    };
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(popup_height) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Meter Settings ")
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = [
+        format!("Weighting: {}", menu.settings.weighting),
+        format!("Mode     : {}", menu.settings.mode),
+        format!(
+            "Max Hold : {}",
+            if menu.settings.is_max {
+                "MAX"
+            } else {
+                "NORMAL"
+            }
+        ),
+        format!("Range    : {}", menu.settings.range),
+    ];
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Use j/k or arrows. h/l or left/right to change.",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(""));
+    for (idx, row) in rows.iter().enumerate() {
+        let prefix = if idx == menu.selected { "> " } else { "  " };
+        let style = if idx == menu.selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("{prefix}{row}"), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Changes auto-save immediately. Press m or Esc to close.",
+        Style::default().fg(Color::Gray),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn history_columns(

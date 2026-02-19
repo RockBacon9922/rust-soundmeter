@@ -52,6 +52,8 @@ cargo run -- set --vid 0x64BD --pid 0x74E3 --set-mode FAST --set-max MAX --set-w
 cargo run -- tui --vid 0x64BD --pid 0x74E3 --tx-interval-ms 120
 ```
 
+Inside TUI: press `m` to open settings; use `j/k` or arrow up/down to select, `h/l` or arrow left/right to change. Changes are auto-saved to the meter.
+
 Optional:
 - Compact poll is enabled by default in `tui`. Use `--compact-poll false` to force standard poll frames only.
 - `--nerd-font auto|on|off` controls glyph style. Default is `off`; set `on` to force the old Nerd Font look.
