@@ -52,6 +52,9 @@ cargo run -- set --vid 0x64BD --pid 0x74E3 --set-mode FAST --set-max MAX --set-w
 cargo run -- tui --vid 0x64BD --pid 0x74E3 --tx-interval-ms 120
 ```
 
+Optional:
+- Compact poll is enabled by default in `tui`. Use `--compact-poll false` to force standard poll frames only.
+
 Notes:
 - `sniff` uses vendor `ReadPoint` polling by default (`--wake true`).
 - Writable startup settings map to vendor `WriteSettings`: `--set-mode FAST|SLOW`, `--set-max MAX|NORMAL`, `--set-weighting A|C`, `--set-range 0..4`.

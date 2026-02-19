@@ -107,8 +107,11 @@ enum Command {
         #[arg(long, default_value = "0x74E3")]
         pid: String,
         /// Poll interval in ms for ReadPoint requests.
-        #[arg(long, default_value_t = 120)]
+        #[arg(long, default_value_t = 60)]
         tx_interval_ms: u64,
+        /// Use a minimal padded ReadPoint poll frame (falls back automatically if rejected).
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        compact_poll: bool,
         /// Apply device mode on startup: FAST or SLOW.
         #[arg(long)]
         set_mode: Option<String>,
@@ -154,6 +157,13 @@ fn protocol_command(code: u8) -> Vec<u8> {
 
 fn protocol_read_point() -> Vec<u8> {
     protocol_command(0xB3)
+}
+
+fn protocol_read_point_compact() -> Vec<u8> {
+    let mut out = vec![0u8; FRAME_LEN];
+    out[0] = REPORT_ID;
+    out[1] = 0xB3;
+    out
 }
 
 fn protocol_write_settings(set: &ProtocolMember) -> Vec<u8> {
@@ -374,6 +384,7 @@ fn main() -> Result<()> {
             vid,
             pid,
             tx_interval_ms,
+            compact_poll,
             set_mode,
             set_max,
             set_weighting,
@@ -382,6 +393,7 @@ fn main() -> Result<()> {
             vid,
             pid,
             tx_interval_ms,
+            compact_poll,
             parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
         ),
         None => cmd_sniff(
@@ -526,6 +538,7 @@ fn cmd_tui(
     vid: String,
     pid: String,
     tx_interval_ms: u64,
+    compact_poll: bool,
     startup_settings: Option<ProtocolMember>,
 ) -> Result<()> {
     let (vid, pid) = lock_target_ids(&vid, &pid)?;
@@ -543,7 +556,7 @@ fn cmd_tui(
     let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
     terminal.clear().context("failed to clear terminal")?;
 
-    let app_result = run_tui(&mut terminal, &dev, vid, pid, tx_interval_ms);
+    let app_result = run_tui(&mut terminal, &dev, vid, pid, tx_interval_ms, compact_poll);
 
     disable_raw_mode().context("failed to disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -559,8 +572,9 @@ fn run_tui(
     vid: u16,
     pid: u16,
     tx_interval_ms: u64,
+    compact_poll: bool,
 ) -> Result<()> {
-    let sample_interval = Duration::from_millis(tx_interval_ms.max(40));
+    let sample_interval = Duration::from_millis(tx_interval_ms.max(20));
     let frame_interval = Duration::from_millis(TUI_FRAME_MS);
     let mut last_tx = Instant::now()
         .checked_sub(sample_interval)
@@ -569,6 +583,9 @@ fn run_tui(
     let mut current = None;
     let mut status = String::from("polling");
     let mut buf = [0u8; MAX_FRAME_BYTES];
+    let compact_frame = protocol_read_point_compact();
+    let standard_frame = protocol_read_point();
+    let mut use_compact = compact_poll;
 
     loop {
         while event::poll(Duration::from_millis(0)).context("failed to poll terminal event")? {
@@ -596,8 +613,20 @@ fn run_tui(
         }
 
         if last_tx.elapsed() >= sample_interval {
-            if let Err(e) = write_frame(dev, &protocol_read_point()) {
-                status = format!("poll write error: {e}");
+            let poll_frame = if use_compact {
+                &compact_frame
+            } else {
+                &standard_frame
+            };
+            if let Err(e) = write_frame(dev, poll_frame) {
+                if use_compact {
+                    use_compact = false;
+                    status = format!("compact poll failed, using standard: {e}");
+                } else {
+                    status = format!("poll write error: {e}");
+                }
+            } else if use_compact {
+                status = String::from("polling (compact)");
             } else {
                 status = String::from("polling");
             }
@@ -651,8 +680,8 @@ fn draw_tui(
         return;
     }
 
-    let (cols, latest_db, center_col) = history_columns(history, inner.width as usize);
-    let lines = build_graph_lines(&cols, inner.height as usize, center_col);
+    let (cols, latest_db, _) = history_columns(history, inner.width as usize);
+    let lines = build_graph_lines(&cols, inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
 
     let shown_db = current.or(latest_db);
@@ -739,7 +768,7 @@ fn history_columns(
     (cols, current, center)
 }
 
-fn build_graph_lines(cols: &[Option<f32>], height: usize, center_col: usize) -> Vec<Line<'static>> {
+fn build_graph_lines(cols: &[Option<f32>], height: usize) -> Vec<Line<'static>> {
     let cols = smooth_columns(cols);
     let heights: Vec<usize> = cols
         .iter()
@@ -755,14 +784,9 @@ fn build_graph_lines(cols: &[Option<f32>], height: usize, center_col: usize) -> 
             if h > 0 {
                 let line_y = height.saturating_sub(h);
                 if y >= line_y {
-                    ch = '#';
+                    ch = '=';
                     style = style.fg(gradient_color_for_row(y, height));
                 }
-            }
-
-            if x == center_col && ch == ' ' {
-                ch = '|';
-                style = style.fg(Color::DarkGray);
             }
 
             spans.push(Span::styled(ch.to_string(), style));
