@@ -1,9 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions, remove_file};
 use std::io::{self, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use chrono::Local;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -12,6 +16,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use hidapi::{DeviceInfo, HidApi, HidDevice};
+use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceInfo};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -19,6 +24,9 @@ use ratatui::layout::Rect;
 use ratatui::prelude::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use russh::keys::key::PublicKey;
+use russh::server::{Auth, Msg, Server as _, Session};
+use russh::{Channel, ChannelId, server};
 
 const DEFAULT_VID: u16 = 0x64BD;
 const DEFAULT_PID: u16 = 0x74E3;
@@ -33,6 +41,9 @@ const FLAG_MODE_FAST: u8 = 0x40;
 const FLAG_MAX: u8 = 0x20;
 const FLAG_WEIGHT_C: u8 = 0x10;
 const TUI_FRAME_MS: u64 = 33;
+const DEFAULT_SSH_PORT: u16 = 2222;
+const PROCESS_LOCK_PATH: &str = "/tmp/ssh-soundmeter.process.lock";
+const HID_LOCK_PATH: &str = "/tmp/ssh-soundmeter.hid.lock";
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-soundmeter")]
@@ -115,6 +126,43 @@ enum Command {
         /// Nerd Font rendering mode for graph/text: auto, on, or off.
         #[arg(long, value_enum, default_value_t = NerdFontMode::Off)]
         nerd_font: NerdFontMode,
+        /// Apply device mode on startup: FAST or SLOW.
+        #[arg(long)]
+        set_mode: Option<String>,
+        /// Apply MAX state on startup: MAX or NORMAL.
+        #[arg(long)]
+        set_max: Option<String>,
+        /// Apply weighting on startup: A or C.
+        #[arg(long)]
+        set_weighting: Option<String>,
+        /// Apply range on startup (vendor docs indicate 0..4).
+        #[arg(long)]
+        set_range: Option<u8>,
+    },
+    /// Host the TUI over SSH (per-connection terminals, resizable).
+    Serve {
+        #[arg(long, default_value = "0x64BD")]
+        vid: String,
+        #[arg(long, default_value = "0x74E3")]
+        pid: String,
+        /// SSH bind address.
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        /// SSH listen port.
+        #[arg(long, default_value_t = DEFAULT_SSH_PORT)]
+        port: u16,
+        /// Poll interval in ms for ReadPoint requests.
+        #[arg(long, default_value_t = 60)]
+        tx_interval_ms: u64,
+        /// Use a minimal padded ReadPoint poll frame (falls back automatically if rejected).
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        compact_poll: bool,
+        /// Nerd Font rendering mode for graph/text.
+        #[arg(long, value_enum, default_value_t = NerdFontMode::Off)]
+        nerd_font: NerdFontMode,
+        /// Publish mDNS service for soundmeter.local.
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        mdns: bool,
         /// Apply device mode on startup: FAST or SLOW.
         #[arg(long)]
         set_mode: Option<String>,
@@ -356,7 +404,8 @@ fn protocol_analysis_read_history_header(buffer: &[u8]) -> Option<ProtocolMember
     })
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Scan { vid, pid }) => cmd_scan(vid, pid),
@@ -408,6 +457,33 @@ fn main() -> Result<()> {
             nerd_font,
             parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
         ),
+        Some(Command::Serve {
+            vid,
+            pid,
+            bind,
+            port,
+            tx_interval_ms,
+            compact_poll,
+            nerd_font,
+            mdns,
+            set_mode,
+            set_max,
+            set_weighting,
+            set_range,
+        }) => {
+            cmd_serve(
+                vid,
+                pid,
+                bind,
+                port,
+                tx_interval_ms,
+                compact_poll,
+                nerd_font,
+                mdns,
+                parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
+            )
+            .await
+        }
         None => cmd_sniff(
             format!("0x{DEFAULT_VID:04X}"),
             format!("0x{DEFAULT_PID:04X}"),
@@ -1231,4 +1307,512 @@ fn format_device_short(dev: &DeviceInfo) -> String {
         manufacturer,
         product
     )
+}
+
+#[derive(Debug)]
+struct SharedTuiState {
+    current: Option<f32>,
+    history: VecDeque<f32>,
+    status: String,
+    sample_interval: Duration,
+}
+
+impl SharedTuiState {
+    fn new(sample_interval: Duration) -> Self {
+        Self {
+            current: None,
+            history: VecDeque::new(),
+            status: String::from("starting"),
+            sample_interval,
+        }
+    }
+}
+
+type SshTerminal = Terminal<CrosstermBackend<SshTerminalHandle>>;
+
+#[derive(Clone)]
+struct SshTerminalHandle {
+    handle: russh::server::Handle,
+    sink: Vec<u8>,
+    channel_id: ChannelId,
+}
+
+impl std::io::Write for SshTerminalHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.sink.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let handle = self.handle.clone();
+        let channel_id = self.channel_id;
+        let data: russh::CryptoVec = self.sink.clone().into();
+        futures::executor::block_on(async move {
+            let _ = handle.data(channel_id, data).await;
+        });
+        self.sink.clear();
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SoundmeterServer {
+    id: usize,
+    vid: u16,
+    pid: u16,
+    nerd_font: bool,
+    clients: Arc<tokio::sync::Mutex<HashMap<usize, SshTerminal>>>,
+    shared_state: Arc<Mutex<SharedTuiState>>,
+}
+
+impl SoundmeterServer {
+    fn new(vid: u16, pid: u16, nerd_font: bool, shared_state: Arc<Mutex<SharedTuiState>>) -> Self {
+        Self {
+            id: 0,
+            vid,
+            pid,
+            nerd_font,
+            clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            shared_state,
+        }
+    }
+
+    fn spawn_render_task(&self) {
+        let clients = self.clients.clone();
+        let shared_state = self.shared_state.clone();
+        let vid = self.vid;
+        let pid = self.pid;
+        let nerd_font = self.nerd_font;
+        tokio::spawn(async move {
+            let frame_interval = Duration::from_millis(TUI_FRAME_MS);
+            loop {
+                tokio::time::sleep(frame_interval).await;
+                let (current, history, status, sample_interval) = {
+                    let guard = shared_state.lock().unwrap();
+                    (
+                        guard.current,
+                        guard.history.clone(),
+                        guard.status.clone(),
+                        guard.sample_interval,
+                    )
+                };
+
+                let mut stale = Vec::new();
+                let mut clients_guard = clients.lock().await;
+                for (id, terminal) in clients_guard.iter_mut() {
+                    if terminal
+                        .draw(|frame| {
+                            draw_tui(
+                                frame,
+                                vid,
+                                pid,
+                                current,
+                                &history,
+                                sample_interval,
+                                &status,
+                                nerd_font,
+                            )
+                        })
+                        .is_err()
+                    {
+                        stale.push(*id);
+                    }
+                }
+                for id in stale {
+                    clients_guard.remove(&id);
+                }
+            }
+        });
+    }
+
+    fn resize_client_terminal(
+        &self,
+        id: usize,
+        col_width: u32,
+        row_height: u32,
+    ) -> Result<(), anyhow::Error> {
+        let mut clients = futures::executor::block_on(self.clients.lock());
+        if let Some(terminal) = clients.get_mut(&id) {
+            terminal.resize(Rect {
+                x: 0,
+                y: 0,
+                width: col_width as u16,
+                height: row_height as u16,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl server::Server for SoundmeterServer {
+    type Handler = Self;
+
+    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
+        let s = self.clone();
+        self.id += 1;
+        s
+    }
+}
+
+#[async_trait]
+impl server::Handler for SoundmeterServer {
+    type Error = anyhow::Error;
+
+    async fn auth_none(&mut self, _: &str) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
+    }
+
+    async fn auth_publickey(&mut self, _: &str, _: &PublicKey) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<Msg>,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let terminal_handle = SshTerminalHandle {
+            handle: session.handle(),
+            sink: Vec::new(),
+            channel_id: channel.id(),
+        };
+        let backend = CrosstermBackend::new(terminal_handle);
+        let terminal = Terminal::new(backend)?;
+        self.clients.lock().await.insert(self.id, terminal);
+        Ok(true)
+    }
+
+    async fn shell_request(
+        &mut self,
+        _channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.request_success();
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        _channel: ChannelId,
+        _term: &str,
+        col_width: u32,
+        row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.resize_client_terminal(self.id, col_width.max(1), row_height.max(1))?;
+        Ok(())
+    }
+
+    async fn window_change_request(
+        &mut self,
+        _channel: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.resize_client_terminal(self.id, col_width.max(1), row_height.max(1))?;
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if data.iter().any(|b| *b == b'q' || *b == 0x03) {
+            self.clients.lock().await.remove(&self.id);
+            session.close(channel);
+        }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.clients.lock().await.remove(&self.id);
+        Ok(())
+    }
+}
+
+struct MdnsRegistration {
+    _daemon: ServiceDaemon,
+    _fullname: String,
+}
+
+struct LockFileGuard {
+    path: String,
+    _file: File,
+}
+
+impl Drop for LockFileGuard {
+    fn drop(&mut self) {
+        let _ = remove_file(&self.path);
+    }
+}
+
+async fn cmd_serve(
+    vid: String,
+    pid: String,
+    bind: String,
+    port: u16,
+    tx_interval_ms: u64,
+    compact_poll: bool,
+    nerd_font_mode: NerdFontMode,
+    mdns: bool,
+    startup_settings: Option<ProtocolMember>,
+) -> Result<()> {
+    let (vid, pid) = lock_target_ids(&vid, &pid)?;
+    let _process_lock = acquire_single_instance_lock(PROCESS_LOCK_PATH, "process")?;
+    let _hid_lock = acquire_single_instance_lock(HID_LOCK_PATH, "hid-port")?;
+    preflight_ssh_port(&bind, port)?;
+
+    let sample_interval = Duration::from_millis(tx_interval_ms.max(20));
+    let shared_state = Arc::new(Mutex::new(SharedTuiState::new(sample_interval)));
+    spawn_hid_sampler(
+        shared_state.clone(),
+        vid,
+        pid,
+        tx_interval_ms,
+        compact_poll,
+        startup_settings,
+    );
+
+    let _mdns_registration = if mdns {
+        Some(register_mdns_service(port)?)
+    } else {
+        None
+    };
+
+    let nerd_font = resolve_nerd_font_mode(nerd_font_mode);
+    let mut server = SoundmeterServer::new(vid, pid, nerd_font, shared_state);
+    server.spawn_render_task();
+
+    println!("SSH TUI server listening on {bind}:{port}");
+    if mdns {
+        println!("mDNS service published for soundmeter.local via _ssh._tcp");
+    }
+    println!("Connect with: ssh -p {port} <user>@soundmeter.local");
+
+    let config = russh::server::Config {
+        inactivity_timeout: Some(Duration::from_secs(3600)),
+        auth_rejection_time: Duration::from_secs(2),
+        auth_rejection_time_initial: Some(Duration::from_secs(0)),
+        keys: vec![
+            russh_keys::key::KeyPair::generate_ed25519().context("host key generation failed")?,
+        ],
+        ..Default::default()
+    };
+
+    server
+        .run_on_address(Arc::new(config), (bind.as_str(), port))
+        .await
+        .context("ssh server failed")
+}
+
+fn acquire_single_instance_lock(path: &str, label: &str) -> Result<Option<LockFileGuard>> {
+    match OpenOptions::new().create_new(true).write(true).open(path) {
+        Ok(mut file) => {
+            writeln!(file, "pid={}", std::process::id()).ok();
+            Ok(Some(LockFileGuard {
+                path: path.to_string(),
+                _file: file,
+            }))
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("[warning] {label} clash: lock file exists ({path})");
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("failed creating lock file for {label}")),
+    }
+}
+
+fn preflight_ssh_port(bind: &str, port: u16) -> Result<()> {
+    match TcpListener::bind((bind, port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[warning] port clash on {bind}:{port}: {e}");
+            Err(e).with_context(|| format!("cannot bind ssh server to {bind}:{port}"))
+        }
+    }
+}
+
+fn register_mdns_service(port: u16) -> Result<MdnsRegistration> {
+    let mdns = ServiceDaemon::new().context("failed to start mDNS daemon")?;
+    let monitor = mdns.monitor().context("failed to create mDNS monitor")?;
+    thread::spawn(move || {
+        while let Ok(event) = monitor.recv() {
+            match event {
+                DaemonEvent::NameChange(change) => {
+                    eprintln!(
+                        "[warning] mdns clash resolved: '{}' renamed to '{}' on {}",
+                        change.original, change.new_name, change.intf_name
+                    );
+                }
+                DaemonEvent::Error(e) => {
+                    eprintln!("[warning] mdns error: {e}");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let service_type = "_ssh._tcp.local.";
+    let instance_name = "soundmeter";
+    let host_name = "soundmeter.local.";
+    let props = [("app", "ssh-soundmeter"), ("host", "soundmeter.local")];
+    let service_info =
+        ServiceInfo::new(service_type, instance_name, host_name, "", port, &props[..])
+            .context("failed to build mDNS service info")?
+            .enable_addr_auto();
+    let fullname = service_info.get_fullname().to_string();
+    mdns.register(service_info)
+        .context("failed to register mDNS service (_ssh._tcp.local)")?;
+
+    Ok(MdnsRegistration {
+        _daemon: mdns,
+        _fullname: fullname,
+    })
+}
+
+fn spawn_hid_sampler(
+    shared_state: Arc<Mutex<SharedTuiState>>,
+    vid: u16,
+    pid: u16,
+    tx_interval_ms: u64,
+    compact_poll: bool,
+    startup_settings: Option<ProtocolMember>,
+) {
+    thread::spawn(move || {
+        let sample_interval = Duration::from_millis(tx_interval_ms.max(20));
+        let compact_frame = protocol_read_point_compact();
+        let standard_frame = protocol_read_point();
+
+        loop {
+            let api = match HidApi::new() {
+                Ok(api) => api,
+                Err(e) => {
+                    set_shared_status(
+                        &shared_state,
+                        format!("hid init error: {e}"),
+                        sample_interval,
+                    );
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            let dev = match open_hid_device(&api, vid, pid) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    set_shared_status(
+                        &shared_state,
+                        format!("hid-port clash/unavailable: {e}"),
+                        sample_interval,
+                    );
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            if let Some(settings) = startup_settings.as_ref()
+                && let Err(e) = apply_startup_settings(&dev, settings)
+            {
+                set_shared_status(
+                    &shared_state,
+                    format!("startup settings write failed: {e}"),
+                    sample_interval,
+                );
+            }
+
+            let mut use_compact = compact_poll;
+            let mut last_tx = Instant::now()
+                .checked_sub(sample_interval)
+                .unwrap_or_else(Instant::now);
+            let mut buf = [0u8; MAX_FRAME_BYTES];
+
+            loop {
+                if last_tx.elapsed() >= sample_interval {
+                    let poll_frame = if use_compact {
+                        &compact_frame
+                    } else {
+                        &standard_frame
+                    };
+                    match write_frame(&dev, poll_frame) {
+                        Ok(_) => {
+                            let status = if use_compact {
+                                "polling (compact)".to_string()
+                            } else {
+                                "polling".to_string()
+                            };
+                            set_shared_status(&shared_state, status, sample_interval);
+                        }
+                        Err(e) => {
+                            if use_compact {
+                                use_compact = false;
+                                set_shared_status(
+                                    &shared_state,
+                                    format!("compact poll rejected, switched to standard: {e}"),
+                                    sample_interval,
+                                );
+                            } else {
+                                set_shared_status(
+                                    &shared_state,
+                                    format!("hid write error: {e}"),
+                                    sample_interval,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    last_tx = Instant::now();
+                }
+
+                match dev.read_timeout(&mut buf, TUI_READ_TIMEOUT_MS) {
+                    Ok(n) if n > 0 => {
+                        if let Some(measurement) = protocol_analysis_read_point(&buf[..n])
+                            && (-50.0..=150.0).contains(&measurement.mea_value)
+                        {
+                            let mut guard = shared_state.lock().unwrap();
+                            guard.current = Some(measurement.mea_value);
+                            guard.history.push_back(measurement.mea_value);
+                            while guard.history.len() > 20_000 {
+                                guard.history.pop_front();
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        set_shared_status(
+                            &shared_state,
+                            format!("hid read error: {e}"),
+                            sample_interval,
+                        );
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+fn set_shared_status(
+    shared_state: &Arc<Mutex<SharedTuiState>>,
+    status: String,
+    sample_interval: Duration,
+) {
+    let mut guard = shared_state.lock().unwrap();
+    guard.status = status;
+    guard.sample_interval = sample_interval;
 }

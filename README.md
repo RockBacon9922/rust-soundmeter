@@ -52,6 +52,18 @@ cargo run -- set --vid 0x64BD --pid 0x74E3 --set-mode FAST --set-max MAX --set-w
 cargo run -- tui --vid 0x64BD --pid 0x74E3 --tx-interval-ms 120
 ```
 
+6. Host the TUI over SSH (per-connection terminal size + resize support):
+
+```bash
+cargo run -- serve --port 2222 --mdns true
+```
+
+Then connect from another machine:
+
+```bash
+ssh -p 2222 <user>@soundmeter.local
+```
+
 Optional:
 - Compact poll is enabled by default in `tui`. Use `--compact-poll false` to force standard poll frames only.
 - `--nerd-font auto|on|off` controls glyph style. Default is `off`; set `on` to force the old Nerd Font look.
@@ -60,3 +72,8 @@ Notes:
 - `sniff` uses vendor `ReadPoint` polling by default (`--wake true`).
 - Writable startup settings map to vendor `WriteSettings`: `--set-mode FAST|SLOW`, `--set-max MAX|NORMAL`, `--set-weighting A|C`, `--set-range 0..4`.
 - If device open fails, the app prints a short list of detected HID devices to help confirm your VID/PID.
+- `serve` prints startup warnings for likely clashes:
+  - same process already running (lockfile check)
+  - SSH port already in use
+  - HID port/device access unavailable
+  - mDNS name conflict or daemon errors
