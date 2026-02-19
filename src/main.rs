@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -112,6 +112,9 @@ enum Command {
         /// Use a minimal padded ReadPoint poll frame (falls back automatically if rejected).
         #[arg(long, default_value_t = true, action = ArgAction::Set)]
         compact_poll: bool,
+        /// Nerd Font rendering mode for graph/text: auto, on, or off.
+        #[arg(long, value_enum, default_value_t = NerdFontMode::Off)]
+        nerd_font: NerdFontMode,
         /// Apply device mode on startup: FAST or SLOW.
         #[arg(long)]
         set_mode: Option<String>,
@@ -125,6 +128,13 @@ enum Command {
         #[arg(long)]
         set_range: Option<u8>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum NerdFontMode {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -385,6 +395,7 @@ fn main() -> Result<()> {
             pid,
             tx_interval_ms,
             compact_poll,
+            nerd_font,
             set_mode,
             set_max,
             set_weighting,
@@ -394,6 +405,7 @@ fn main() -> Result<()> {
             pid,
             tx_interval_ms,
             compact_poll,
+            nerd_font,
             parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
         ),
         None => cmd_sniff(
@@ -539,6 +551,7 @@ fn cmd_tui(
     pid: String,
     tx_interval_ms: u64,
     compact_poll: bool,
+    nerd_font_mode: NerdFontMode,
     startup_settings: Option<ProtocolMember>,
 ) -> Result<()> {
     let (vid, pid) = lock_target_ids(&vid, &pid)?;
@@ -556,7 +569,16 @@ fn cmd_tui(
     let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
     terminal.clear().context("failed to clear terminal")?;
 
-    let app_result = run_tui(&mut terminal, &dev, vid, pid, tx_interval_ms, compact_poll);
+    let nerd_font = resolve_nerd_font_mode(nerd_font_mode);
+    let app_result = run_tui(
+        &mut terminal,
+        &dev,
+        vid,
+        pid,
+        tx_interval_ms,
+        compact_poll,
+        nerd_font,
+    );
 
     disable_raw_mode().context("failed to disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -573,6 +595,7 @@ fn run_tui(
     pid: u16,
     tx_interval_ms: u64,
     compact_poll: bool,
+    nerd_font: bool,
 ) -> Result<()> {
     let sample_interval = Duration::from_millis(tx_interval_ms.max(20));
     let frame_interval = Duration::from_millis(TUI_FRAME_MS);
@@ -650,11 +673,62 @@ fn run_tui(
         }
 
         terminal
-            .draw(|frame| draw_tui(frame, vid, pid, current, &history, sample_interval, &status))
+            .draw(|frame| {
+                draw_tui(
+                    frame,
+                    vid,
+                    pid,
+                    current,
+                    &history,
+                    sample_interval,
+                    &status,
+                    nerd_font,
+                )
+            })
             .context("failed drawing terminal frame")?;
 
         thread::sleep(frame_interval);
     }
+}
+
+fn resolve_nerd_font_mode(mode: NerdFontMode) -> bool {
+    match mode {
+        NerdFontMode::On => true,
+        NerdFontMode::Off => false,
+        NerdFontMode::Auto => detect_nerd_font(),
+    }
+}
+
+fn detect_nerd_font() -> bool {
+    if let Ok(v) = std::env::var("SSH_SOUNDMETER_NERD_FONT") {
+        let value = v.trim().to_ascii_lowercase();
+        if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+        if matches!(value.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+    }
+
+    let utf8_locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter().any(|k| {
+        std::env::var(k)
+            .map(|v| v.to_ascii_uppercase().contains("UTF-8"))
+            .unwrap_or(false)
+    });
+    if !utf8_locale {
+        return false;
+    }
+
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let term = std::env::var("TERM").unwrap_or_default();
+    matches!(
+        term_program.as_str(),
+        "WezTerm" | "iTerm.app" | "WarpTerminal" | "vscode"
+    ) || term.contains("xterm")
+        || term.contains("kitty")
+        || term.contains("alacritty")
+        || term.contains("wezterm")
+        || term.contains("tmux")
 }
 
 fn draw_tui(
@@ -665,6 +739,7 @@ fn draw_tui(
     history: &VecDeque<f32>,
     sample_interval: Duration,
     status: &str,
+    nerd_font: bool,
 ) {
     let history_seconds =
         (sample_interval.as_secs_f32() * frame.area().width as f32).round() as u32;
@@ -681,15 +756,15 @@ fn draw_tui(
     }
 
     let (cols, latest_db, _) = history_columns(history, inner.width as usize);
-    let lines = build_graph_lines(&cols, inner.height as usize);
+    let lines = build_graph_lines(&cols, inner.height as usize, nerd_font);
     frame.render_widget(Paragraph::new(lines), inner);
 
     let shown_db = current.or(latest_db);
     let current_text = shown_db
         .map(|db| format!("{db:.1}"))
         .unwrap_or_else(|| "n/a".to_string());
-    let scale = compute_big_scale(inner.width, inner.height, &current_text);
-    let (big_w, big_h) = big_text_size(&current_text, scale);
+    let scale = compute_big_scale(inner.width, inner.height, &current_text, nerd_font);
+    let (big_w, big_h) = big_text_size(&current_text, scale, nerd_font);
     let tx = inner
         .x
         .saturating_add(inner.width / 2)
@@ -707,6 +782,7 @@ fn draw_tui(
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
         scale,
+        nerd_font,
     );
 
     let unit = "dB";
@@ -768,7 +844,7 @@ fn history_columns(
     (cols, current, center)
 }
 
-fn build_graph_lines(cols: &[Option<f32>], height: usize) -> Vec<Line<'static>> {
+fn build_graph_lines(cols: &[Option<f32>], height: usize, nerd_font: bool) -> Vec<Line<'static>> {
     let cols = smooth_columns(cols);
     let heights: Vec<usize> = cols
         .iter()
@@ -784,7 +860,7 @@ fn build_graph_lines(cols: &[Option<f32>], height: usize) -> Vec<Line<'static>> 
             if h > 0 {
                 let line_y = height.saturating_sub(h);
                 if y >= line_y {
-                    ch = '=';
+                    ch = if nerd_font { '󰇝' } else { '=' };
                     style = style.fg(gradient_color_for_row(y, height));
                 }
             }
@@ -865,11 +941,11 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
-fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
+fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str, nerd_font: bool) -> u16 {
     let base_h = 5u16;
     let mut base_w = 0u16;
     for ch in text.chars() {
-        base_w = base_w.saturating_add(big_glyph(ch)[0].chars().count() as u16);
+        base_w = base_w.saturating_add(big_glyph(ch, nerd_font)[0].chars().count() as u16);
         base_w = base_w.saturating_add(1);
     }
     base_w = base_w.saturating_sub(1);
@@ -883,10 +959,10 @@ fn compute_big_scale(inner_w: u16, inner_h: u16, text: &str) -> u16 {
     by_w.min(by_h).clamp(1, 4)
 }
 
-fn big_text_size(text: &str, scale: u16) -> (u16, u16) {
+fn big_text_size(text: &str, scale: u16, nerd_font: bool) -> (u16, u16) {
     let mut width = 0u16;
     for ch in text.chars() {
-        let glyph = big_glyph(ch);
+        let glyph = big_glyph(ch, nerd_font);
         width = width.saturating_add((glyph[0].chars().count() as u16).saturating_mul(scale));
         width = width.saturating_add(scale);
     }
@@ -900,6 +976,7 @@ fn render_big_text(
     text: &str,
     style: Style,
     scale: u16,
+    nerd_font: bool,
 ) {
     if text.is_empty() {
         return;
@@ -909,7 +986,7 @@ fn render_big_text(
     let mut cursor_x = x;
 
     for ch in text.chars() {
-        let glyph = big_glyph(ch);
+        let glyph = big_glyph(ch, nerd_font);
         for (row_idx, row) in glyph.iter().enumerate() {
             for sy in 0..scale {
                 let yy = y
@@ -932,11 +1009,32 @@ fn render_big_text(
                 }
             }
         }
-        cursor_x = cursor_x.saturating_add((big_glyph(ch)[0].chars().count() as u16 + 1) * scale);
+        cursor_x = cursor_x
+            .saturating_add((big_glyph(ch, nerd_font)[0].chars().count() as u16 + 1) * scale);
     }
 }
 
-fn big_glyph(ch: char) -> [&'static str; 5] {
+fn big_glyph(ch: char, nerd_font: bool) -> [&'static str; 5] {
+    if nerd_font {
+        return match ch {
+            '0' => ["█████", "█   █", "█   █", "█   █", "█████"],
+            '1' => ["  ██ ", " ███ ", "  ██ ", "  ██ ", "█████"],
+            '2' => ["█████", "    █", "█████", "█    ", "█████"],
+            '3' => ["█████", "    █", " ████", "    █", "█████"],
+            '4' => ["█   █", "█   █", "█████", "    █", "    █"],
+            '5' => ["█████", "█    ", "█████", "    █", "█████"],
+            '6' => ["█████", "█    ", "█████", "█   █", "█████"],
+            '7' => ["█████", "    █", "   █ ", "  █  ", " █   "],
+            '8' => ["█████", "█   █", "█████", "█   █", "█████"],
+            '9' => ["█████", "█   █", "█████", "    █", "█████"],
+            '.' => ["     ", "     ", "     ", "     ", "  ██ "],
+            '-' => ["     ", "     ", "█████", "     ", "     "],
+            'n' | 'N' => ["     ", "███  ", "█  █ ", "█  ██", "█   █"],
+            'a' | 'A' => ["     ", " ███ ", "█   █", "█████", "█   █"],
+            '/' => ["    █", "   █ ", "  █  ", " █   ", "█    "],
+            _ => ["     ", "  ?  ", "  ?  ", "  ?  ", "     "],
+        };
+    }
     match ch {
         '0' => ["#####", "#   #", "#   #", "#   #", "#####"],
         '1' => ["  ## ", " ### ", "  ## ", "  ## ", "#####"],

@@ -54,6 +54,7 @@ cargo run -- tui --vid 0x64BD --pid 0x74E3 --tx-interval-ms 120
 
 Optional:
 - Compact poll is enabled by default in `tui`. Use `--compact-poll false` to force standard poll frames only.
+- `--nerd-font auto|on|off` controls glyph style. Default is `off`; set `on` to force the old Nerd Font look.
 
 Notes:
 - `sniff` uses vendor `ReadPoint` polling by default (`--wake true`).
