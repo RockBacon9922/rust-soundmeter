@@ -465,12 +465,12 @@ fn main() -> Result<()> {
             nerd_font,
             parse_startup_settings(set_mode, set_max, set_weighting, set_range)?,
         ),
-        None => cmd_sniff(
+        None => cmd_tui(
             format!("0x{DEFAULT_VID:04X}"),
             format!("0x{DEFAULT_PID:04X}"),
-            None,
+            60,
             true,
-            1000,
+            NerdFontMode::Off,
             None,
         ),
     }

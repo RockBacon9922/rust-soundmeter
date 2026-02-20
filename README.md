@@ -22,6 +22,12 @@ cargo build
 
 ## Usage
 
+Run with default mode (TUI):
+
+```bash
+cargo run
+```
+
 1. Enumerate HID devices:
 
 ```bash
