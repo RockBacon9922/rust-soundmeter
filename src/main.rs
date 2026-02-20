@@ -794,8 +794,6 @@ fn run_tui(
             .draw(|frame| {
                 draw_tui(
                     frame,
-                    vid,
-                    pid,
                     current,
                     &history,
                     sample_interval,
@@ -852,8 +850,6 @@ fn detect_nerd_font() -> bool {
 
 fn draw_tui(
     frame: &mut ratatui::Frame<'_>,
-    vid: u16,
-    pid: u16,
     current: Option<f32>,
     history: &VecDeque<f32>,
     sample_interval: Duration,
@@ -863,9 +859,15 @@ fn draw_tui(
 ) {
     let history_seconds =
         (sample_interval.as_secs_f32() * frame.area().width as f32).round() as u32;
-    let title = format!(
-        "Volume History  VID=0x{vid:04X} PID=0x{pid:04X}  window=~{history_seconds}s  m=settings  q/Ctrl+C=quit"
-    );
+    let title = Line::from(vec![
+        Span::styled(
+            "Stoneham's Soundmeter TUI",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " window=~{history_seconds}s  m=settings  q/Ctrl+C=quit"
+        )),
+    ]);
     let block = Block::default().borders(Borders::ALL).title(title);
     let area = frame.area();
     let inner = block.inner(area);
@@ -954,7 +956,7 @@ fn draw_settings_popup(frame: &mut ratatui::Frame<'_>, area: Rect, menu: &Settin
         area.width
     };
     let popup_height = if area.height >= 7 {
-        area.height.min(11)
+        area.height.min(13)
     } else {
         area.height
     };
@@ -987,7 +989,7 @@ fn draw_settings_popup(frame: &mut ratatui::Frame<'_>, area: Rect, menu: &Settin
     ];
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "Use j/k or arrows. h/l or left/right to change.",
+        "Use arrow keys/vim bindings to navigate",
         Style::default().fg(Color::Gray),
     )));
     lines.push(Line::from(""));
@@ -1004,10 +1006,38 @@ fn draw_settings_popup(frame: &mut ratatui::Frame<'_>, area: Rect, menu: &Settin
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Changes auto-save immediately. Press m or Esc to close.",
+        "Changes auto-save immediately.",
         Style::default().fg(Color::Gray),
     )));
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines.push(Line::from(Span::styled(
+        "Press m or Esc to close.",
+        Style::default().fg(Color::Gray),
+    )));
+    let body_rect = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    if body_rect.height > 0 {
+        frame.render_widget(Paragraph::new(lines), body_rect);
+    }
+
+    if inner.height > 0 {
+        let footer_rect = Rect {
+            x: inner.x,
+            y: inner.bottom().saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Made by william stoneham",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            footer_rect,
+        );
+    }
 }
 
 fn history_columns(
